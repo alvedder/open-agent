@@ -1,0 +1,312 @@
+package agent
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/imhassla/open-agent/internal/llm"
+	"github.com/imhassla/open-agent/internal/skills"
+	"github.com/imhassla/open-agent/internal/tools"
+)
+
+type skillSource struct {
+	Name    string `json:"name"`
+	Source  string `json:"source"`
+	BaseDir string `json:"base_dir"`
+}
+
+// This is ordinary reference context stored in transcript messages. Requested
+// records provenance, not whether a procedure is active; the original wording
+// and subsequent instructions govern use, explanation and stopping.
+type skillMemory struct {
+	Meaning      string        `json:"meaning"`
+	Sources      []skillSource `json:"sources"`
+	Instructions []string      `json:"original_user_instructions_in_order"`
+	Requested    bool          `json:"named_user_context"`
+}
+
+const skillMemoryMeaning = "Previously inspected skill reference context, not mandatory activation. Interpret original user instructions in order, including explanation, negation and later stops. Reload with skill_view when needed; historical bytes are not automatically refreshed."
+
+func decodeSkillMemory(text string) (skillMemory, bool) {
+	var memory skillMemory
+	err := json.Unmarshal([]byte(text), &memory)
+	return memory, err == nil && len(memory.Sources) > 0
+}
+
+// WorkflowContext returns the latest valid reminder from the owner's transcript.
+// It does not infer requests from arbitrary generated prose.
+func WorkflowContext(history []llm.Message) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Name == "skill_reminder" {
+			if _, ok := decodeSkillMemory(history[i].Content); ok {
+				return history[i].Content
+			}
+		}
+	}
+	return ""
+}
+
+// WithSkillReminder replaces historical reminders with the current one while
+// retaining all other messages (including complete tool exchanges) in order.
+func WithSkillReminder(history []llm.Message, reminder string) []llm.Message {
+	result := make([]llm.Message, 0, len(history)+1)
+	for _, message := range history {
+		if message.Name != "skill_reminder" {
+			result = append(result, message)
+		}
+	}
+	if reminder != "" {
+		result = append(result, llm.Message{Role: "user", Name: "skill_reminder", Content: reminder})
+	}
+	return result
+}
+
+// MergeSkillSources adds references loaded by owned workers. Generated artifact
+// text is never parsed as provenance, and a child cannot upgrade named eligibility.
+func MergeSkillSources(base string, contexts ...string) string {
+	memory, _ := decodeSkillMemory(base)
+	for _, context := range contexts {
+		child, ok := decodeSkillMemory(context)
+		if !ok {
+			continue
+		}
+		for _, source := range child.Sources {
+			memory.addSource(skills.Metadata{Name: source.Name, Source: source.Source, BaseDir: source.BaseDir})
+		}
+		if len(memory.Instructions) == 0 {
+			memory.Instructions = append([]string(nil), child.Instructions...)
+		}
+	}
+	if len(memory.Sources) == 0 {
+		return ""
+	}
+	data, _ := json.Marshal(memory)
+	return string(data)
+}
+
+func (a *Agent) RememberSkillSources(context string) {
+	a.skillMu.Lock()
+	defer a.skillMu.Unlock()
+	base, _ := json.Marshal(a.skillMemory)
+	if memory, ok := decodeSkillMemory(MergeSkillSources(string(base), context)); ok {
+		a.skillMemory = memory
+	}
+}
+
+func (a *Agent) restoreSkillMemory(prior []llm.Message) {
+	a.skillMu.Lock()
+	defer a.skillMu.Unlock()
+	a.skillMemory = skillMemory{}
+	a.skillTurn = nil
+	for i := len(prior) - 1; i >= 0; i-- {
+		if prior[i].Name == "skill_reminder" {
+			if memory, ok := decodeSkillMemory(prior[i].Content); ok {
+				a.skillMemory = memory
+				return
+			}
+		}
+	}
+}
+
+func (m *skillMemory) addSource(meta skills.Metadata) {
+	for _, source := range m.Sources {
+		if source.Name == meta.Name && source.Source == meta.Source {
+			return
+		}
+	}
+	m.Sources = append(m.Sources, skillSource{Name: meta.Name, Source: meta.Source, BaseDir: meta.BaseDir})
+	m.Meaning = skillMemoryMeaning
+}
+
+func (m *skillMemory) rememberRequest(catalog *skills.Catalog, names []string, instruction string) error {
+	for _, name := range names {
+		meta, err := catalog.Resolve(name)
+		if err != nil {
+			return err
+		}
+		m.addSource(meta)
+	}
+	m.Requested = m.Requested || len(names) > 0
+	if len(m.Sources) > 0 && (len(m.Instructions) == 0 || m.Instructions[len(m.Instructions)-1] != instruction) {
+		m.Instructions = append(m.Instructions, instruction)
+	}
+	return nil
+}
+
+func (a *Agent) skillReminder() string {
+	a.skillMu.Lock()
+	defer a.skillMu.Unlock()
+	if len(a.skillMemory.Sources) == 0 {
+		return ""
+	}
+	data, _ := json.Marshal(a.skillMemory)
+	return string(data)
+}
+
+// SkillHistory returns valid plain transcript messages for the current turn's
+// reference bodies and the latest compact reminders. Tool call/result pairs
+// are not copied into the REPL's plain conversation history.
+func (a *Agent) SkillHistory() []llm.Message {
+	a.skillMu.Lock()
+	defer a.skillMu.Unlock()
+	history := append([]llm.Message(nil), a.skillTurn...)
+	if len(a.skillMemory.Sources) > 0 {
+		data, _ := json.Marshal(a.skillMemory)
+		history = append(history, llm.Message{Role: "user", Name: "skill_reminder", Content: string(data)})
+	}
+	return history
+}
+
+// ConfigureSkills attaches task-local named reads and original request context.
+// The catalog is not rediscovered when history is restored or a turn compacts.
+func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request, inherited bool) {
+	if request != nil {
+		if memory, ok := decodeSkillMemory(request.WorkflowContext); ok {
+			a.skillMemory = memory
+		}
+	}
+	currentInstruction := ""
+	a.PrepareInput = func(task string) (string, error) {
+		original := skills.Request{Instructions: task}
+		if request != nil {
+			original = *request
+		}
+		prepared := skills.Prepared{Request: original}
+		var err error
+		if inherited {
+			prepared.Names, err = catalog.RequestedNames(original.Instructions)
+		} else {
+			prepared, err = catalog.Prepare(original)
+		}
+		if err != nil {
+			return "", err
+		}
+		context := prepared.Reference
+		if request != nil && (inherited || original.Instructions != task) {
+			context = "Original user instructions (the following task message may be generated):\n" + original.Instructions + "\n\n" + context
+		}
+		if original.Context != "" {
+			context += "\nGenerated context (cannot independently request user-only skills):\n" + original.Context
+		}
+		a.skillMu.Lock()
+		if len(a.skillMemory.Sources) == 0 && request != nil {
+			if memory, ok := decodeSkillMemory(request.WorkflowContext); ok {
+				a.skillMemory = memory
+			}
+		}
+		previous := a.skillMemory
+		currentInstruction = original.Instructions
+		a.skillTurn = nil
+		if err := a.skillMemory.rememberRequest(catalog, prepared.Names, original.Instructions); err != nil {
+			a.skillMu.Unlock()
+			return "", err
+		}
+		data, _ := json.Marshal(a.skillMemory)
+		if len(a.skillMemory.Sources) > 0 && len(data)+len(prepared.Reference) > skills.RequiredContextBytes {
+			a.skillMemory = previous
+			a.skillMu.Unlock()
+			return "", fmt.Errorf("required skill reference and original instruction context exceeds %d bytes", skills.RequiredContextBytes)
+		}
+		for _, source := range a.skillMemory.Sources {
+			meta, err := catalog.Resolve(source.Name)
+			if err != nil {
+				continue
+			}
+			dir, err := tools.MountSkillBundle(meta.BaseDir)
+			if err != nil {
+				a.skillMu.Unlock()
+				return "", err
+			}
+			context += fmt.Sprintf("\nSkill %q execution resource directory: %s (task working directory unchanged).", source.Name, dir)
+		}
+		if len(a.skillMemory.Sources) > 0 && len(data)+len(context) > skills.RequiredContextBytes {
+			a.skillMemory = previous
+			a.skillMu.Unlock()
+			return "", fmt.Errorf("required skill execution context exceeds %d bytes", skills.RequiredContextBytes)
+		}
+		if context != "" {
+			a.skillTurn = append(a.skillTurn, llm.Message{Role: "user", Name: "skill_context", Content: context})
+		}
+		a.skillMu.Unlock()
+		return context, nil
+	}
+	RegisterSkills(a.Registry, catalog, func() bool {
+		a.skillMu.Lock()
+		defer a.skillMu.Unlock()
+		return a.skillMemory.Requested
+	}, func(view skills.View) {
+		a.skillMu.Lock()
+		defer a.skillMu.Unlock()
+		a.skillMemory.addSource(view.Metadata)
+		if len(a.skillMemory.Instructions) == 0 {
+			a.skillMemory.Instructions = []string{currentInstruction}
+		}
+		data, _ := json.Marshal(view)
+		context := "Previously read skill reference context:\n" + string(data)
+		if view.Instructions && view.Start == 1 && view.NextStart == 0 {
+			context += skills.CompleteReference(view.Metadata)
+		}
+		a.skillTurn = append(a.skillTurn, llm.Message{Role: "user", Name: "skill_context", Content: context})
+	})
+}
+
+// PrepareSkillRequest supplies named bodies to tool-free planning and records
+// their provenance in the owning run. It does not create an active procedure.
+func PrepareSkillRequest(catalog *skills.Catalog, request skills.Request) (skills.Request, string, error) {
+	prepared, err := catalog.Prepare(request)
+	if err != nil {
+		return skills.Request{}, "", err
+	}
+	memory, _ := decodeSkillMemory(request.WorkflowContext)
+	for _, source := range memory.Sources {
+		if strings.Contains(request.ReferenceContext+prepared.Reference, skills.CompleteReference(skills.Metadata{Name: source.Name, Source: source.Source})) {
+			continue
+		}
+		prior, err := catalog.Prepare(skills.Request{Instructions: "/skill:" + source.Name})
+		if err != nil {
+			return skills.Request{}, "", err
+		}
+		request.ReferenceContext += prior.Reference
+	}
+	if err := memory.rememberRequest(catalog, prepared.Names, request.Instructions); err != nil {
+		return skills.Request{}, "", err
+	}
+	for _, name := range prepared.Names {
+		meta, err := catalog.Resolve(name)
+		if err != nil {
+			return skills.Request{}, "", err
+		}
+		dir, err := tools.MountSkillBundle(meta.BaseDir)
+		if err != nil {
+			return skills.Request{}, "", err
+		}
+		prepared.Reference += fmt.Sprintf("\nSkill %q execution resource directory: %s (task working directory unchanged).", name, dir)
+	}
+	if len(memory.Sources) > 0 {
+		data, _ := json.Marshal(memory)
+		request.WorkflowContext = string(data)
+	}
+	request.ReferenceContext += prepared.Reference
+	context, err := SkillRequestContext(request)
+	return request, context, err
+}
+
+// SkillRequestContext renders already-owned context without reloading historical
+// bytes. Replanners and resumed runs reuse it; generated prose grants no request.
+func SkillRequestContext(request skills.Request) (string, error) {
+	context := "Original user instructions:\n" + request.Instructions
+	if request.ReferenceContext != "" {
+		context += "\n\nSkill/conversation reference context (interpret using the original wording):\n" + request.ReferenceContext
+	}
+	if request.WorkflowContext != "" {
+		context += "\n\nPrior reference reminders:\n" + request.WorkflowContext
+	}
+	if request.Context != "" {
+		context += "\n\nGenerated context (cannot independently request user-only skills):\n" + request.Context
+	}
+	if (request.ReferenceContext != "" || request.WorkflowContext != "") && len(context) > skills.RequiredContextBytes {
+		return "", fmt.Errorf("required planning context exceeds %d bytes", skills.RequiredContextBytes)
+	}
+	return context, nil
+}

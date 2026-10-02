@@ -29,6 +29,7 @@ import (
 	"github.com/imhassla/open-agent/internal/llm"
 	"github.com/imhassla/open-agent/internal/orchestrator"
 	"github.com/imhassla/open-agent/internal/rating"
+	"github.com/imhassla/open-agent/internal/skills"
 	"github.com/imhassla/open-agent/internal/telemetry"
 	"github.com/imhassla/open-agent/internal/tools"
 )
@@ -278,6 +279,7 @@ func runOneShot(deps *orchestrator.Deps, role orchestrator.Role, task string, op
 	deps.Emit = event.NewBus(sinks...)
 	defer func() { deps.Emit = prevEmit }()
 	ag, err := orchestrator.BuildWorker(role, deps, orchestrator.Options{
+		Request:       &skills.Request{Instructions: task, Context: os.Getenv(skills.GeneratedContextEnv)},
 		ModelOverride: opts.model, MaxSteps: opts.maxSteps, Verbose: opts.verbose,
 		// Stream to stdout (not the default stderr) so the live output IS the
 		// answer on stdout; the reprint below is then guarded on AnswerStreamed
@@ -291,6 +293,9 @@ func runOneShot(deps *orchestrator.Deps, role orchestrator.Role, task string, op
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
+		if opts.jsonOut {
+			printEnvelope(resultEnvelope{OK: false, Error: err.Error(), RunID: runID})
+		}
 		os.Exit(1)
 	}
 	res, runErr := ag.Run(ctx, task)

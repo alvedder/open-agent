@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/imhassla/open-agent/internal/agent"
 	"github.com/imhassla/open-agent/internal/budget"
 	"github.com/imhassla/open-agent/internal/event"
+	"github.com/imhassla/open-agent/internal/skills"
 )
 
 // maxReplanDepth bounds how deep a failed task may be re-decomposed. One level is
@@ -29,7 +31,21 @@ func DefaultReplanner(ctx context.Context, d *Deps, t Task, failure string) (*Pl
 		"Take a genuinely DIFFERENT approach (different decomposition, tools, or strategy).\n\n" +
 		"TASK:\n" + t.Goal +
 		"\n\nWHY THE PREVIOUS ATTEMPT FAILED:\n" + failure
-	return MakePlan(ctx, d, goal)
+	request := skills.Request{}
+	if t.Request != nil {
+		request = *t.Request
+	}
+	reference, err := agent.SkillRequestContext(request)
+	if err != nil {
+		return nil, err
+	}
+	rt, _ := d.route(RolePlan)
+	p, err := makePlanWithRoute(ctx, d.Client, rt, goal, nil, request, reference)
+	if err != nil {
+		p = singleTaskPlan(goal)
+	}
+	p.Request = &request
+	return p, nil
 }
 
 // runTaskWithReplan runs a task through the verifier (with Reflexion retries) and,
@@ -58,6 +74,7 @@ func runTaskWithReplan(ctx context.Context, d *Deps, t Task, inputs map[string]A
 	if verr := sub.Validate(); verr != nil {
 		return art, err // never hand a degenerate plan to the executor
 	}
+	sub.Request = t.Request // sub-plans cannot invent original user instructions
 
 	// Free our worker slot while the nested run executes, so the replan draws from
 	// the SAME bounded pool instead of adding to it. Re-acquire before returning so

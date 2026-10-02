@@ -128,6 +128,76 @@ For scripted/agent callers (e.g. a supervising LLM delegating subtasks), see
 [`AGENTS.md`](AGENTS.md) — the machine contract (`--json` envelope, cost caps, tier
 policy, sandbox recipes).
 
+**Local skills** — `code`, `ask` and `research` discover `SKILL.md` bundles recursively
+in project `.agents/skills/` and `~/.agents/skills/`. The project root is the nearest
+Git worktree root, or cwd outside Git. Project names override personal names with a
+stderr diagnostic; duplicate names within one scope are ambiguous. Symlinked
+bundles work; aliases and directory cycles are deduplicated.
+
+```markdown
+---
+name: review
+description: Review changes using the project's conventions.
+disable-model-invocation: false
+---
+Read references/checklist.md, then review the changes.
+```
+
+`name` defaults to the bundle directory's name; `description` is required. YAML
+frontmatter is parsed as YAML. The boolean `disable-model-invocation` hides a
+user-only skill from automatic selection. Descriptive metadata is inert;
+unsupported behavioral fields such as `allowed-tools` are diagnosed and ignored.
+Workers receive a bounded metadata catalog and use `skills_list(cursor)` and
+`skill_view(name, file_path, start, end)` to read instructions and UTF-8 resources.
+Resources are relative to the canonical bundle, with traversal and escaping
+symlinks rejected. Reads run no preprocessing and install no dependencies. Pages
+report `next_cursor` or `next_start`; view ranges are 1-based and inclusive. A
+single line that cannot fit a view page fails clearly and must be split.
+
+Request a skill with `/review`, `/skill:review`, or plain language naming it,
+anywhere in the prompt: `open-agent ask "Explain the changes, then use /review"`.
+Leading interactive built-in commands retain their meaning; `/skill:help` names
+a skill that collides with `/help`. Paths and URLs do not become slash requests.
+Distinct named bodies are provided as reference blocks in first-mention order.
+The model interprets the complete user wording: explaining or negating a skill
+does not instruct it to run the procedure. Requested workflows can read named
+user-only helpers lazily. The flag is an invocation policy, not a filesystem
+security boundary; existing code tools can still read files.
+
+Follow-ups and `--continue` retain reference bodies and the original instruction
+sequence in the conversation. Compaction can summarize bodies while preserving
+name/source reminders for another `skill_view`. Explanation remains explanation;
+later stop instructions supersede earlier use. `/reset` clears and immediately
+saves history; `/rewind` restores the matching context. Restoring a conversation
+does not refresh loaded bytes; another actual read uses current files.
+
+`do` planners receive named reference bodies before decomposition and retain the
+original request separately from their generated goals. Workers and spawned
+children inherit request intent and source reminders, loading bodies/helpers
+as needed. Interactive `/do` carries the continuing context; `do --resume`
+restores the saved request and reference context. Judges retain their existing
+independent evaluation criteria. Required planning context that cannot fit
+fails clearly.
+
+Scheduled `code`, `ask`, `research` and `do` tasks invoke skills from any position
+in their saved instructions. Upstream chain output travels as generated context
+and cannot independently request user-only skills. Discovery still uses the
+schedule daemon's working directory. Ask retains its existing capability limits.
+
+Candidates discover skills from their actual isolated checkout and accessible
+user root. Committed project skills arrive through Git; ignored parent bundles
+are unavailable, and untracked files still fail the existing clean-tree check.
+Missing requested skills fail visibly. No bundles are copied from the parent.
+
+With `--sandbox`, loaded bundles and later helpers have stable readonly shell
+paths under `/skills/`, reported as `execution_dir`. Selected bundles reachable
+through `/work` are readonly there too; other project files remain writable.
+If the working directory is inside a selected bundle, that directory is readonly.
+Host file tools retain their existing behavior. Scripts must use the reported
+execution directory and dependencies already present in the sandbox image.
+Whole-agent `open-agent sandbox` environments discover their own guest-local
+project and user skills; host skill directories are never mounted implicitly.
+
 **Guardrails** (on by default): mutating file *tools* refuse to write outside the working
 directory (absolute paths out of tree, `../` escapes, symlink targets), and `bash` rejects
 a tight list of catastrophic command shapes (recursive `rm` of `/` or `~`, force-push —
