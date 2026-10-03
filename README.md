@@ -187,6 +187,12 @@ Scheduled `code`, `ask`, `research` and `do` tasks invoke skills from any positi
 in their saved instructions. Upstream chain output travels as generated context
 and cannot independently request user-only skills. Discovery still uses the
 schedule daemon's working directory. Ask retains its existing capability limits.
+Requested workflows may read named user-only helpers, and scheduled runs use the
+same cost ceilings as direct requests. For example:
+
+```sh
+open-agent schedule add --every daily --max-cost 0.05 code "Check changes using /review"
+```
 
 Candidates discover skills from their actual isolated checkout and accessible
 user root. Committed project skills arrive through Git; ignored parent bundles

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -157,7 +158,7 @@ func runScheduleDaemon(store *schedule.Store, opts options) {
 // user task so it cannot independently request a user-only skill.
 func fireJob(ctx context.Context, self string, j *schedule.Job, chainCtx string) {
 	fmt.Fprintf(os.Stderr, "[%s] firing %s (%s)\n", time.Now().Format("15:04:05"), j.ID, j.Verb)
-	cargs := []string{j.Verb, "--json", "--max-cost", fmt.Sprintf("%f", j.MaxCost), "--", j.Task}
+	cargs := []string{j.Verb, "--json", "--max-cost", strconv.FormatFloat(j.MaxCost, 'g', -1, 64), "--", j.Task}
 	cmd := exec.CommandContext(ctx, self, cargs...)
 	cmd.Env = append(os.Environ(), skills.GeneratedContextEnv+"="+chainCtx)
 	cmd.Stdin = nil
