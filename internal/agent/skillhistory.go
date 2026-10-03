@@ -215,7 +215,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			return "", fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
 		reminder, _ := json.Marshal(a.skillMemory)
-		execution, err := skillExecutionContext(catalog, a.skillMemory.Sources)
+		execution, _, err := skillExecutionContext(catalog, a.skillMemory.Sources)
 		if err != nil || (len(a.skillMemory.Sources) > 0 && len(reminder)+len(execution) > skills.RequiredContextBytes) {
 			a.skillMemory = prior
 			a.skillMu.Unlock()
@@ -254,8 +254,9 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			a.skillMu.Unlock()
 			return "", fmt.Errorf("required skill reference and original instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
-		execution, err = skillExecutionContext(catalog, a.skillMemory.Sources)
+		execution, mounts, err := skillExecutionContext(catalog, a.skillMemory.Sources)
 		if err != nil {
+			a.skillMemory = previous
 			a.skillMu.Unlock()
 			return "", err
 		}
@@ -268,6 +269,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 		if context != "" {
 			a.skillTurn = append(a.skillTurn, llm.Message{Role: "user", Name: "skill_context", Content: context})
 		}
+		commitSkillMounts(mounts)
 		a.skillMu.Unlock()
 		return context, nil
 	}
@@ -287,7 +289,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			return fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
 		reminder, _ := json.Marshal(a.skillMemory)
-		execution, err := skillExecutionContext(catalog, a.skillMemory.Sources)
+		execution, mounts, err := skillExecutionContext(catalog, a.skillMemory.Sources)
 		if err != nil {
 			a.skillMemory = previous
 			return err
@@ -302,36 +304,65 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			context += skills.CompleteReference(view.Metadata)
 		}
 		a.skillTurn = append(a.skillTurn, llm.Message{Role: "user", Name: "skill_context", Content: context})
+		commitSkillMounts(mounts)
 		return nil
 	})
 }
 
-func skillExecutionContext(catalog *skills.Catalog, sources []skillSource) (string, error) {
+func skillExecutionContext(catalog *skills.Catalog, sources []skillSource) (string, []tools.SkillMount, error) {
 	var text strings.Builder
+	var mounts []tools.SkillMount
 	for _, source := range sources {
 		meta, err := catalog.Resolve(source.Name)
 		if err != nil {
 			continue
 		}
-		dir, err := tools.MountSkillBundle(meta.BaseDir)
+		mount, err := tools.PrepareSkillMount(meta.BaseDir)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
-		fmt.Fprintf(&text, "\nSkill %q execution resource directory: %s (task working directory unchanged).", source.Name, dir)
+		mounts = append(mounts, mount)
+		fmt.Fprintf(&text, "\nSkill %q execution resource directory: %s (task working directory unchanged).", source.Name, mount.ExecutionDir())
 	}
-	return text.String(), nil
+	return text.String(), mounts, nil
 }
 
-// PrepareSkillRequest supplies named bodies to tool-free planning and records
-// their provenance in the owning run. It does not create an active procedure.
+func commitSkillMounts(mounts []tools.SkillMount) {
+	for _, mount := range mounts {
+		mount.Commit()
+	}
+}
+
+// PreparedSkillRequest holds owned planning context and its uncommitted mounts.
+// Call Commit only after any additional generated planning text has been checked.
+type PreparedSkillRequest struct {
+	Request skills.Request
+	Context string
+	mounts  []tools.SkillMount
+}
+
+func (p PreparedSkillRequest) Commit() { commitSkillMounts(p.mounts) }
+
+// PrepareSkillRequest accepts a request with no additional planning payload.
 func PrepareSkillRequest(catalog *skills.Catalog, request skills.Request) (skills.Request, string, error) {
-	prepared, err := catalog.Prepare(request)
+	prepared, err := PlanSkillRequest(catalog, request)
 	if err != nil {
 		return skills.Request{}, "", err
 	}
+	prepared.Commit()
+	return prepared.Request, prepared.Context, nil
+}
+
+// PlanSkillRequest supplies named bodies to tool-free planning and records their
+// provenance without changing shell mounts. It does not create an active procedure.
+func PlanSkillRequest(catalog *skills.Catalog, request skills.Request) (PreparedSkillRequest, error) {
+	prepared, err := catalog.Prepare(request)
+	if err != nil {
+		return PreparedSkillRequest{}, err
+	}
 	memory, _ := decodeSkillMemory(request.WorkflowContext)
 	if err := memory.rememberRequest(catalog, prepared.Names, request.Instructions); err != nil {
-		return skills.Request{}, "", err
+		return PreparedSkillRequest{}, err
 	}
 	if len(memory.Sources) > 0 {
 		data, _ := json.Marshal(memory)
@@ -340,21 +371,26 @@ func PrepareSkillRequest(catalog *skills.Catalog, request skills.Request) (skill
 	request.ReferenceContext += prepared.Reference
 	request, err = completeSkillReferences(catalog, request)
 	if err != nil {
-		return skills.Request{}, "", err
+		return PreparedSkillRequest{}, err
 	}
+	var mounts []tools.SkillMount
 	for _, name := range prepared.Names {
 		meta, err := catalog.Resolve(name)
 		if err != nil {
-			return skills.Request{}, "", err
+			return PreparedSkillRequest{}, err
 		}
-		dir, err := tools.MountSkillBundle(meta.BaseDir)
+		mount, err := tools.PrepareSkillMount(meta.BaseDir)
 		if err != nil {
-			return skills.Request{}, "", err
+			return PreparedSkillRequest{}, err
 		}
-		request.ReferenceContext += fmt.Sprintf("\nSkill %q execution resource directory: %s (task working directory unchanged).", name, dir)
+		mounts = append(mounts, mount)
+		request.ReferenceContext += fmt.Sprintf("\nSkill %q execution resource directory: %s (task working directory unchanged).", name, mount.ExecutionDir())
 	}
 	context, err := SkillRequestContext(request)
-	return request, context, err
+	if err != nil {
+		return PreparedSkillRequest{}, err
+	}
+	return PreparedSkillRequest{Request: request, Context: context, mounts: mounts}, nil
 }
 
 // CompleteSkillRequest supplies missing instruction bodies for owned source

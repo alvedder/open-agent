@@ -13,12 +13,16 @@ func preparePlanningRequest(goal string, request skills.Request) (skills.Request
 	if err != nil {
 		return skills.Request{}, "", err
 	}
-	request, reference, err := agent.PrepareSkillRequest(catalog, request)
+	prepared, err := agent.PlanSkillRequest(catalog, request)
 	if err != nil {
 		return skills.Request{}, "", err
 	}
-	text, err := planningRequestText(goal, request, reference)
-	return request, text, err
+	text, err := planningRequestText(goal, prepared.Request, prepared.Context)
+	if err != nil {
+		return skills.Request{}, "", err
+	}
+	prepared.Commit()
+	return prepared.Request, text, nil
 }
 
 // Validate the whole variable payload before any model-failure fallback can

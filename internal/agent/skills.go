@@ -40,10 +40,11 @@ func RegisterSkills(reg *Registry, catalog *skills.Catalog, allowUserOnly func()
 			if err != nil {
 				return "", err
 			}
-			view.ExecutionDir, err = tools.MountSkillBundle(view.BaseDir)
+			mount, err := tools.PrepareSkillMount(view.BaseDir)
 			if err != nil {
 				return "", fmt.Errorf("skill execution resources: %w", err)
 			}
+			view.ExecutionDir = mount.ExecutionDir()
 			data, err := json.Marshal(view)
 			if err == nil && len(data) > skills.ViewBytes {
 				return "", fmt.Errorf("skill execution metadata exceeds the view page limit; request a smaller start/end range")
@@ -52,6 +53,9 @@ func RegisterSkills(reg *Registry, catalog *skills.Catalog, allowUserOnly func()
 				if err := onRead(view); err != nil {
 					return "", err
 				}
+			}
+			if err == nil {
+				mount.Commit()
 			}
 			return string(data), err
 		},

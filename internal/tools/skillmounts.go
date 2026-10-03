@@ -16,44 +16,74 @@ type skillMounts struct {
 	bundles map[string]string // canonical source → stable execution directory
 }
 
-// MountSkillBundle registers one loaded bundle for subsequent shell invocations.
-// This does not run Docker, execute the skill or provision dependencies. Ordinary
-// host execution uses the real bundle path; whole-agent sandboxes remain guest-local.
-func MountSkillBundle(base string) (string, error) {
-	if docker, ok := active.(interface{ mountSkill(string) (string, error) }); ok {
-		return docker.mountSkill(base)
-	}
-	return base, nil
+// SkillMount describes a validated bundle path without changing shell mounts.
+// Commit registers it only after the enclosing read or preparation succeeds.
+type SkillMount struct {
+	executionDir string
+	source       string
+	mounts       *skillMounts
 }
 
-func (d DockerSandbox) mountSkill(base string) (string, error) {
-	canonical, err := filepath.EvalSymlinks(base)
+func (m SkillMount) ExecutionDir() string { return m.executionDir }
+
+// Commit is idempotent and cannot fail after preparation. Host execution needs
+// no registration; Docker shell invocations see only committed bundles.
+func (m SkillMount) Commit() {
+	if m.mounts == nil {
+		return
+	}
+	m.mounts.mu.Lock()
+	defer m.mounts.mu.Unlock()
+	m.mounts.bundles[m.source] = m.executionDir
+}
+
+// PrepareSkillMount validates execution resources without registering them.
+// This does not run Docker, execute the skill or provision dependencies. Ordinary
+// host execution uses the real bundle path; whole-agent sandboxes remain guest-local.
+func PrepareSkillMount(base string) (SkillMount, error) {
+	if docker, ok := active.(interface {
+		prepareSkillMount(string) (SkillMount, error)
+	}); ok {
+		return docker.prepareSkillMount(base)
+	}
+	return SkillMount{executionDir: base}, nil
+}
+
+// MountSkillBundle registers an already accepted bundle for subsequent shells.
+func MountSkillBundle(base string) (string, error) {
+	mount, err := PrepareSkillMount(base)
 	if err != nil {
 		return "", err
+	}
+	mount.Commit()
+	return mount.ExecutionDir(), nil
+}
+
+func (d DockerSandbox) prepareSkillMount(base string) (SkillMount, error) {
+	canonical, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return SkillMount{}, err
 	}
 	canonical, err = filepath.Abs(canonical)
 	if err != nil {
-		return "", err
+		return SkillMount{}, err
 	}
 	info, err := os.Stat(canonical)
 	if err != nil {
-		return "", err
+		return SkillMount{}, err
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("skill bundle must be a directory")
+		return SkillMount{}, fmt.Errorf("skill bundle must be a directory")
 	}
 	if d.mounts == nil {
-		return "", fmt.Errorf("Docker sandbox skill mounts were not initialized")
-	}
-	d.mounts.mu.Lock()
-	defer d.mounts.mu.Unlock()
-	if alias, ok := d.mounts.bundles[canonical]; ok {
-		return alias, nil
+		return SkillMount{}, fmt.Errorf("Docker sandbox skill mounts were not initialized")
 	}
 	id := sha256.Sum256([]byte(canonical))
-	alias := fmt.Sprintf("/skills/%x", id)
-	d.mounts.bundles[canonical] = alias
-	return alias, nil
+	return SkillMount{
+		executionDir: fmt.Sprintf("/skills/%x", id),
+		source:       canonical,
+		mounts:       d.mounts,
+	}, nil
 }
 
 func bindMount(source, target string, readonly bool) string {
