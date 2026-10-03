@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -107,6 +108,9 @@ func (c *Catalog) walk(root, scope string, seen map[string]bool) map[string][]Me
 				c.note("%s: %v", file, err)
 			} else {
 				entries[m.Name] = append(entries[m.Name], m)
+				if _, fits := catalogMetadata(m); !m.UserOnly && !fits {
+					c.note("%s: metadata exceeds catalog page limit; omitted from automatic lists, bounded named reads remain available", file)
+				}
 			}
 		}
 		children, err := os.ReadDir(canonical)
@@ -134,6 +138,13 @@ func (c *Catalog) metadata(file, base, scope string) (Metadata, error) {
 	}
 	if !inside(base, resolved) {
 		return m, fmt.Errorf("SKILL.md escapes bundle")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return m, err
+	}
+	if !info.Mode().IsRegular() {
+		return m, fmt.Errorf("SKILL.md must be a regular file")
 	}
 	f, err := os.Open(resolved)
 	if err != nil {
@@ -169,7 +180,7 @@ func (c *Catalog) metadata(file, base, scope string) (Metadata, error) {
 	} else {
 		m.Name = filepath.Base(base)
 	}
-	if m.Name == "" || strings.ContainsAny(m.Name, "/\\ \t\r\n") || m.Name == "." || m.Name == ".." {
+	if m.Name == "" || strings.ContainsAny(m.Name, "/\\") || strings.IndexFunc(m.Name, unicode.IsSpace) >= 0 || m.Name == "." || m.Name == ".." {
 		return m, fmt.Errorf("unusable skill name %q", m.Name)
 	}
 	if !conventionalName.MatchString(m.Name) || len(m.Name) > 64 {

@@ -147,6 +147,8 @@ Read references/checklist.md, then review the changes.
 frontmatter is parsed as YAML. The boolean `disable-model-invocation` hides a
 user-only skill from automatic selection. Descriptive metadata is inert;
 unsupported behavioral fields such as `allowed-tools` are diagnosed and ignored.
+Metadata too large for a catalog page is omitted with a diagnostic; named reads
+retain their ordinary bounds. Nonregular instruction files are skipped.
 Workers receive a bounded metadata catalog and use `skills_list(cursor)` and
 `skill_view(name, file_path, start, end)` to read instructions and UTF-8 resources.
 Resources are relative to the canonical bundle, with traversal and escaping
@@ -158,6 +160,8 @@ Request a skill with `/review`, `/skill:review`, or plain language naming it,
 anywhere in the prompt: `open-agent ask "Explain the changes, then use /review"`.
 Leading interactive built-in commands retain their meaning; `/skill:help` names
 a skill that collides with `/help`. Paths and URLs do not become slash requests.
+An existing root path such as `/tmp` stays a path unless `tmp` is a known skill;
+`/skill:tmp` always requests the skill, including when it is unavailable.
 Distinct named bodies are provided as reference blocks in first-mention order.
 The model interprets the complete user wording: explaining or negating a skill
 does not instruct it to run the procedure. Requested workflows can read named

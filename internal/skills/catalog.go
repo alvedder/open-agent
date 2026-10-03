@@ -69,7 +69,9 @@ func (c *Catalog) List(cursor string) (Page, error) {
 	for _, name := range c.names() {
 		m, err := c.Resolve(name)
 		if err == nil && !m.UserOnly {
-			visible = append(visible, m)
+			if m, fits := catalogMetadata(m); fits {
+				visible = append(visible, m)
+			}
 		}
 	}
 	if start > len(visible) {
@@ -78,7 +80,6 @@ func (c *Catalog) List(cursor string) (Page, error) {
 	page := Page{Skills: []Metadata{}}
 	for i := start; i < len(visible); i++ {
 		m := visible[i]
-		m.Description = abbreviate(m.Description, 1024)
 		candidate := Page{Skills: append(append([]Metadata{}, page.Skills...), m)}
 		if i+1 < len(visible) {
 			candidate.NextCursor = strconv.Itoa(i + 1)
@@ -97,6 +98,14 @@ func (c *Catalog) List(cursor string) (Page, error) {
 		page = candidate
 	}
 	return page, nil
+}
+
+// Account for the page wrapper and a maximum-width cursor before listing an
+// entry. One unlistable identity must not prevent access to healthy entries.
+func catalogMetadata(m Metadata) (Metadata, bool) {
+	m.Description = abbreviate(m.Description, 1024)
+	data, err := json.Marshal(Page{Skills: []Metadata{m}, NextCursor: "99999999999999999999"})
+	return m, err == nil && len(data) <= CatalogBytes
 }
 
 func abbreviate(text string, limit int) string {

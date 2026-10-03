@@ -499,3 +499,25 @@ func TestSkillsOneShotKeepsJSONEnvelopeAndStderrDiagnostics(t *testing.T) {
 		}
 	}
 }
+
+func TestSkillsOneShotRootPathQuestionReachesModel(t *testing.T) {
+	if _, err := os.Lstat("/tmp"); err != nil {
+		t.Skipf("root path fixture unavailable: %v", err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSkillsJSONHelper$")
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir(), "OPEN_AGENT_SKILLS_TEST_HELPER=1", "OPEN_AGENT_SKILLS_TEST_PROMPT=Explain what /tmp is used for")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("ordinary root path question failed before model: %v: %s: %s", err, out, stderr.String())
+	}
+	var envelope resultEnvelope
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		t.Fatalf("invalid JSON envelope: %v: %s", err, out)
+	}
+	if !envelope.OK || envelope.Steps != 1 || envelope.Answer != "Turn completed." {
+		t.Fatalf("root path question did not reach model: %+v", envelope)
+	}
+}

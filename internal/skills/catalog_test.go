@@ -1,12 +1,15 @@
 package skills_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/imhassla/open-agent/internal/skills"
 )
@@ -229,5 +232,93 @@ func TestDiscoverAndReadProjectOverride(t *testing.T) {
 	}
 	if len(c.Diagnostics) != 1 || !strings.Contains(c.Diagnostics[0], "overrides") {
 		t.Fatalf("diagnostics = %v", c.Diagnostics)
+	}
+}
+
+func TestUnicodeWhitespaceNamesAreInvalid(t *testing.T) {
+	for _, name := range []string{"review\u00a0helper", "review\u202fhelper", "review\u3000helper"} {
+		project := t.TempDir()
+		bundle(t, project, "fixture", fmt.Sprintf("---\nname: %q\ndescription: Fixture\n---\nInstructions.", name))
+		catalog := skills.Discover(project, t.TempDir())
+		page, err := catalog.List("")
+		if err != nil || len(page.Skills) != 0 {
+			t.Errorf("uninvocable name %q listed: %+v, %v", name, page, err)
+		}
+		if _, err := catalog.View(name, "", 0, 0); err == nil {
+			t.Errorf("uninvocable name %q resolved", name)
+		}
+		if len(catalog.Diagnostics) != 1 || !strings.Contains(catalog.Diagnostics[0], "unusable skill name") {
+			t.Errorf("unusable identity %q was not diagnosed: %v", name, catalog.Diagnostics)
+		}
+	}
+}
+
+func TestMetadataNonRegularDiscoveryHelper(t *testing.T) {
+	root := os.Getenv("OPEN_AGENT_NONREGULAR_SKILL_ROOT")
+	if root == "" {
+		return
+	}
+	catalog := skills.Discover(root, "")
+	page, err := catalog.List("")
+	if err != nil || len(page.Skills) != 1 || page.Skills[0].Name != "valid" {
+		t.Fatalf("nonregular instruction source disrupted healthy skills: %+v, %v", page, err)
+	}
+	if _, err := catalog.Resolve("invalid"); err == nil {
+		t.Error("nonregular instruction source resolved")
+	}
+	if len(catalog.Diagnostics) != 1 || !strings.Contains(catalog.Diagnostics[0], "regular file") {
+		t.Errorf("nonregular instruction source lacked diagnostic: %v", catalog.Diagnostics)
+	}
+}
+
+func TestDiscoveryRejectsNonRegularInstructionSourcesWithoutBlocking(t *testing.T) {
+	for _, kind := range []string{"directory", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			bundle(t, root, "valid", "---\ndescription: Healthy fixture\n---\nInstructions.")
+			dir := filepath.Join(root, ".agents", "skills", "invalid")
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(dir, "SKILL.md")
+			if kind == "directory" {
+				if err := os.Mkdir(source, 0755); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				mkfifo, err := exec.LookPath("mkfifo")
+				if err != nil {
+					t.Skip("mkfifo unavailable")
+				}
+				if out, err := exec.Command(mkfifo, source).CombinedOutput(); err != nil {
+					t.Fatalf("create FIFO: %v: %s", err, out)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMetadataNonRegularDiscoveryHelper$")
+			cmd.Env = append(os.Environ(), "OPEN_AGENT_NONREGULAR_SKILL_ROOT="+root)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("discovery blocked or rejected healthy skills: %v: %s", err, out)
+			}
+		})
+	}
+}
+
+func TestOversizedMetadataDoesNotHideHealthySkills(t *testing.T) {
+	project := t.TempDir()
+	name := strings.Repeat("a", 9000)
+	bundle(t, project, "oversized", "---\nname: "+name+"\ndescription: Large identity\n---\nInstructions.")
+	bundle(t, project, "healthy", "---\ndescription: Healthy\n---\nInstructions.")
+	catalog := skills.Discover(project, t.TempDir())
+	page, err := catalog.List("")
+	if err != nil || len(page.Skills) != 1 || page.Skills[0].Name != "healthy" {
+		t.Fatalf("oversized metadata prevented healthy catalog: entries=%d, error=%v", len(page.Skills), err != nil)
+	}
+	if _, err := catalog.View(name, "", 0, 0); err != nil {
+		t.Fatalf("bounded named read unavailable: %v", err)
+	}
+	if !strings.Contains(strings.Join(catalog.Diagnostics, "\n"), "omitted from automatic lists") {
+		t.Error("oversized metadata omission was not diagnosed")
 	}
 }

@@ -1,6 +1,7 @@
 package skills_test
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -71,6 +72,49 @@ func TestAcceptedNonconventionalNamesKeepExplicitNamespacedInvocation(t *testing
 			prepared, err := catalog.Prepare(skills.Request{Instructions: prompt})
 			if err != nil || len(prepared.Names) != 1 || prepared.Names[0] != name {
 				t.Fatalf("namespaced %s: %+v, %v", name, prepared, err)
+			}
+		}
+	}
+}
+
+func TestExistingRootPathsDoNotBecomeMissingSkillRequests(t *testing.T) {
+	catalog := skills.Discover(t.TempDir(), t.TempDir())
+	for _, path := range []string{"/tmp", "/etc"} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Skipf("root path fixture unavailable: %s: %v", path, err)
+		}
+		for _, text := range []string{"Explain " + path, "Read configuration under (" + path + ")."} {
+			prepared, err := catalog.Prepare(skills.Request{Instructions: text})
+			if err != nil || len(prepared.Names) != 0 {
+				t.Errorf("root path %q became a skill request: %+v, %v", text, prepared, err)
+			}
+		}
+	}
+	for _, text := range []string{"Use /skill:tmp", "Use /open-agent-missing-skill-fixture"} {
+		if _, err := catalog.Prepare(skills.Request{Instructions: text}); err == nil {
+			t.Errorf("missing explicit skill %q accepted", text)
+		}
+	}
+	project := t.TempDir()
+	bundle(t, project, "tmp", "---\ndescription: Fixture\ndisable-model-invocation: true\n---\nTmp skill instructions.")
+	catalog = skills.Discover(project, t.TempDir())
+	for _, text := range []string{"Use /tmp", "Use /skill:tmp"} {
+		prepared, err := catalog.Prepare(skills.Request{Instructions: text})
+		if err != nil || len(prepared.Names) != 1 || prepared.Names[0] != "tmp" {
+			t.Errorf("known skill %q lost precedence: %+v, %v", text, prepared, err)
+		}
+	}
+}
+
+func TestSlashRequestsUseUnicodeWhitespaceBoundaries(t *testing.T) {
+	project, home := t.TempDir(), t.TempDir()
+	bundle(t, project, "review", "---\ndescription: Fixture\ndisable-model-invocation: true\n---\nReview instructions.")
+	catalog := skills.Discover(project, home)
+	for _, space := range []string{"\u00a0", "\u202f", "\u3000", "\v"} {
+		for _, prompt := range []string{"Use" + space + "/review", "/review" + space + "after editing", "After editing," + space + "/skill:review"} {
+			prepared, err := catalog.Prepare(skills.Request{Instructions: prompt})
+			if err != nil || len(prepared.Names) != 1 || prepared.Names[0] != "review" || prepared.Instructions != prompt {
+				t.Errorf("Unicode request %q lost explicit context: %+v, %v", prompt, prepared, err)
 			}
 		}
 	}

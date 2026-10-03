@@ -2,6 +2,7 @@ package skills
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -46,7 +47,8 @@ func IsBuiltin(name string) bool {
 	return false
 }
 
-var slashReference = regexp.MustCompile(`(?:^|[\s("'\x60\[])(/(\S+))`)
+// Include Unicode separators and non-ASCII whitespace at both token boundaries.
+var slashReference = regexp.MustCompile(`(?:^|[\s\v\p{Z}\x{0085}("'\x60\[])(/([^\s\v\p{Z}\x{0085}]+))`)
 var conventionalReference = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 type reference struct {
@@ -74,8 +76,16 @@ func (c *Catalog) references(text string) []reference {
 			}
 			name = name[:len(name)-size]
 		}
-		if !namespaced && len(c.entries[name]) == 0 && (strings.ContainsAny(name, "/\\.") || !conventionalReference.MatchString(name)) {
-			continue
+		if !namespaced && len(c.entries[name]) == 0 {
+			if strings.ContainsAny(name, "/\\.") || !conventionalReference.MatchString(name) {
+				continue
+			}
+			// A single-component absolute path has the same spelling as a bare
+			// command. Existing paths remain paths; /skill:name forces resolution.
+			// Known skill identities above retain their explicit invocation meaning.
+			if _, err := os.Lstat("/" + name); err == nil {
+				continue
+			}
 		}
 		if !namespaced && IsBuiltin(name) {
 			continue
