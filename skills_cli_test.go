@@ -13,6 +13,7 @@ import (
 
 	"github.com/imhassla/open-agent/internal/llm"
 	"github.com/imhassla/open-agent/internal/orchestrator"
+	"github.com/imhassla/open-agent/internal/rating"
 	"github.com/imhassla/open-agent/internal/schedule"
 	"github.com/imhassla/open-agent/internal/telemetry"
 )
@@ -21,7 +22,13 @@ func TestSkillsJSONHelper(t *testing.T) {
 	if os.Getenv("OPEN_AGENT_SKILLS_TEST_HELPER") != "1" {
 		return
 	}
-	d := &orchestrator.Deps{Client: &sessionSkillModel{}, Tlog: telemetry.Open(filepath.Join(os.Getenv("HOME"), "t.jsonl"))}
+	d := &orchestrator.Deps{
+		Client: &sessionSkillModel{}, Tlog: telemetry.Open(filepath.Join(os.Getenv("HOME"), "t.jsonl")),
+		Rating: rating.Open(filepath.Join(os.Getenv("HOME"), "ratings.json")),
+	}
+	if os.Getenv("OPEN_AGENT_SKILLS_TEST_MODEL_ERROR") == "1" {
+		d.Client = &failedSkillModel{}
+	}
 	if os.Getenv("OPEN_AGENT_SKILLS_TEST_SCHEDULE") == "1" {
 		args := os.Args[1:]
 		for i, arg := range args {
@@ -82,6 +89,78 @@ func TestSkillPreparationErrorsKeepJSONEnvelope(t *testing.T) {
 				t.Fatalf("failure envelope: %+v", envelope)
 			}
 		}
+	}
+}
+
+func TestSkillPreparationFailuresDoNotTrainRouter(t *testing.T) {
+	for _, failure := range []string{"missing", "invalid", "ambiguous", "oversized"} {
+		t.Run(failure, func(t *testing.T) {
+			root, home := t.TempDir(), t.TempDir()
+			bundles := map[string]string{}
+			switch failure {
+			case "invalid":
+				bundles["workflow"] = "---\nname: workflow\n---\nMissing description."
+			case "ambiguous":
+				for _, dir := range []string{"one", "two"} {
+					bundles[dir] = "---\nname: workflow\ndescription: Fixture\n---\nInstructions."
+				}
+			case "oversized":
+				bundles["workflow"] = "---\ndescription: Fixture\n---\n" + strings.Repeat("Procedure line.\n", 4000)
+			}
+			for name, text := range bundles {
+				dir := filepath.Join(root, ".agents", "skills", name)
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(text), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command(os.Args[0], "-test.run=^TestSkillsJSONHelper$")
+			cmd.Dir = root
+			cmd.Env = append(os.Environ(), "HOME="+home, "OPEN_AGENT_SKILLS_TEST_HELPER=1", "OPEN_AGENT_SKILLS_TEST_PROMPT=Use /skill:workflow")
+			out, err := cmd.Output()
+			if err == nil {
+				t.Fatal("invalid skill request succeeded")
+			}
+			var envelope resultEnvelope
+			if err := json.Unmarshal(out, &envelope); err != nil {
+				t.Fatalf("missing failure envelope: %s", out)
+			}
+			if envelope.OK || envelope.Error == "" || envelope.Steps != 0 || envelope.CostUSD != 0 || envelope.Model == "" {
+				t.Fatalf("expected failure before model execution: %+v", envelope)
+			}
+			if stat, ok := rating.Open(filepath.Join(home, "ratings.json")).Get("ask", envelope.Model); ok {
+				t.Fatalf("skill preparation trained the model rating: %+v", stat)
+			}
+		})
+	}
+}
+
+type failedSkillModel struct{ sessionSkillModel }
+
+func (d *failedSkillModel) Chat(context.Context, []llm.Message, llm.ChatOptions) (*llm.Response, error) {
+	return nil, fmt.Errorf("fixture model failed without reported usage")
+}
+
+func TestOneShotModelFailuresStillTrainRouter(t *testing.T) {
+	home := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestSkillsJSONHelper$")
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(), "HOME="+home, "OPEN_AGENT_SKILLS_TEST_HELPER=1", "OPEN_AGENT_SKILLS_TEST_MODEL_ERROR=1", "OPEN_AGENT_SKILLS_TEST_PROMPT=Answer this question")
+	out, err := cmd.Output()
+	if err == nil {
+		t.Fatal("failed model succeeded")
+	}
+	var envelope resultEnvelope
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		t.Fatalf("missing failure envelope: %s", out)
+	}
+	if envelope.OK || envelope.Error == "" || envelope.Steps != 1 || envelope.CostUSD != 0 {
+		t.Fatalf("expected attempted model failure: %+v", envelope)
+	}
+	if stat, ok := rating.Open(filepath.Join(home, "ratings.json")).Get("ask", envelope.Model); !ok || stat.Samples != 1 || stat.PassRate != 0 {
+		t.Fatalf("model failure did not train the router: %+v, present=%v", stat, ok)
 	}
 }
 
@@ -195,6 +274,11 @@ func TestSkillsOneShotKeepsJSONEnvelopeAndStderrDiagnostics(t *testing.T) {
 		}
 		if missing && (!strings.Contains(env.Error, "unavailable") || env.CostUSD != 0) {
 			t.Fatalf("missing skill envelope = %+v", env)
+		}
+		if !missing {
+			if stat, ok := rating.Open(filepath.Join(home, "ratings.json")).Get("ask", env.Model); !ok || stat.Samples != 1 || stat.PassRate != 1 {
+				t.Fatalf("successful model did not train the router: %+v, present=%v", stat, ok)
+			}
 		}
 		if !strings.Contains(stderr.String(), "overrides") {
 			t.Fatalf("missing stderr diagnostic: %s", stderr.String())

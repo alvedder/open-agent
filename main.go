@@ -305,9 +305,9 @@ func runOneShot(deps *orchestrator.Deps, role orchestrator.Role, task string, op
 	if runErr == nil && (res == nil || strings.TrimSpace(res.Answer) == "") {
 		runErr = fmt.Errorf("run produced an empty answer (%d steps, ~$%.4f spent)", stepsOf(res), ag.TotalCost)
 	}
-	// Feed the outcome to the cost-ladder router (unless the user aborted — that
-	// is not the model's fault).
-	if !errors.Is(runErr, context.Canceled) {
+	// Only attempted model steps train the router. Invalid skill requests fail
+	// before execution; neither they nor user aborts establish model inadequacy.
+	if ag.StepsTaken > 0 && !errors.Is(runErr, context.Canceled) {
 		deps.RecordOneShotOutcome(role, task, ag.Model, ag.TotalCost, runErr == nil)
 	}
 	// On a fatal error res is nil, but the agent still counted its loop iterations —
