@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -525,5 +526,176 @@ func TestOversizedSkillFollowupDoesNotPreventContinuation(t *testing.T) {
 				t.Fatal("oversized failed input prevented continuation of the prior workflow")
 			}
 		})
+	}
+}
+
+type automaticCapProbeModel struct {
+	sessionSkillModel
+	calls     int
+	taskCalls int
+	read      bool
+	capError  bool
+}
+
+func (m *automaticCapProbeModel) Chat(_ context.Context, msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+	m.calls++
+	if len(opts.Tools) > 0 {
+		m.taskCalls++
+	}
+	for _, msg := range msgs {
+		if msg.Role == "tool" && strings.Contains(msg.Content, "context exceeds 48000 bytes") {
+			m.capError = true
+		}
+	}
+	if m.read && m.calls == 1 {
+		return &llm.Response{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "auto", Type: "function", Function: llm.FunctionCall{Name: "skill_view", Arguments: `{"name":"workflow"}`}}}}}, nil
+	}
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "Fixture answer."}}, nil
+}
+func TestAutomaticSkillReadCannotPoisonPersistedContinuation(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	t.Setenv("OPEN_AGENT_GENERATED_CONTEXT", "")
+	dir := filepath.Join(root, ".agents", "skills", "workflow")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Workflow fixture\n---\nSmall procedure."), 0644); err != nil {
+		t.Fatal(err)
+	}
+	first := &automaticCapProbeModel{read: true}
+	s := &session{deps: &orchestrator.Deps{Client: first, Tlog: telemetry.Open(filepath.Join(home, "fixture.jsonl"))}, opts: options{noStream: true, maxSteps: 3}}
+	original := strings.Repeat("ordinary task text ", 4000)
+	s.converse(context.Background(), orchestrator.RoleAsk, original)
+	data, err := os.ReadFile(sessionStatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state sessionState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	reminder := agent.WorkflowContext(state.History)
+	if !first.capError {
+		t.Error("oversized automatic skill read did not report its context error")
+	}
+	if reminder != "" {
+		t.Errorf("rejected first read persisted a skill reminder of %d bytes", len(reminder))
+	}
+	if first.taskCalls < 2 {
+		t.Error("ordinary long prompt lost its existing model capacity")
+	}
+	next := &automaticCapProbeModel{}
+	resumed := &session{deps: &orchestrator.Deps{Client: next, Tlog: s.deps.Tlog}, opts: options{noStream: true, maxSteps: 3}, history: state.History}
+	resumed.converse(context.Background(), orchestrator.RoleAsk, "Continue")
+	if historyChars(state.History) > historyBudget {
+		t.Errorf("automatic read persisted %d bytes above %d cap", historyChars(state.History), historyBudget)
+	}
+	if next.taskCalls == 0 {
+		t.Error("short continuation never reached model")
+	}
+}
+
+type automaticManySkillModel struct {
+	sessionSkillModel
+	names     []string
+	reads     int
+	calls     int
+	taskCalls int
+	capError  bool
+}
+
+func (m *automaticManySkillModel) Chat(_ context.Context, msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+	m.calls++
+	if len(opts.Tools) > 0 {
+		m.taskCalls++
+	}
+	for _, msg := range msgs {
+		if msg.Role == "tool" && strings.Contains(msg.Content, "context exceeds 48000 bytes") {
+			m.capError = true
+		}
+	}
+	if len(opts.Tools) > 0 && m.reads < len(m.names) {
+		args, _ := json.Marshal(map[string]string{"name": m.names[m.reads]})
+		m.reads++
+		return &llm.Response{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: fmt.Sprintf("read-%d", m.reads), Type: "function", Function: llm.FunctionCall{Name: "skill_view", Arguments: string(args)}}}}}, nil
+	}
+	return &llm.Response{Message: llm.Message{Role: "assistant", Content: "Fixture answer."}}, nil
+}
+
+func TestAutomaticSkillReadsBoundExecutionContextBeforeContinuation(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	t.Setenv("OPEN_AGENT_GENERATED_CONTEXT", "")
+	model := &automaticManySkillModel{}
+	for i := 0; i < 6; i++ {
+		name := fmt.Sprintf("helper-%d-", i) + strings.Repeat("x", 4990)
+		model.names = append(model.names, name)
+		dir := filepath.Join(root, ".agents", "skills", fmt.Sprintf("helper-%d", i))
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: "+name+"\ndescription: Fixture\n---\nSmall reference."), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &session{deps: &orchestrator.Deps{Client: model, Tlog: telemetry.Open(filepath.Join(home, "fixture.jsonl"))}, opts: options{noStream: true, maxSteps: 10}}
+	s.converse(context.Background(), orchestrator.RoleAsk, "Investigate the evidence")
+	state, ok := loadSession()
+	if !ok {
+		t.Fatal("session missing")
+	}
+	reminder := agent.WorkflowContext(state.History)
+	if !model.capError || reminder == "" || strings.Contains(reminder, model.names[5]) {
+		t.Error("oversized read did not fail atomically while retaining earlier reads")
+	}
+	if historyChars(state.History) > historyBudget {
+		t.Error("persisted history exceeds budget")
+	}
+	next := &automaticManySkillModel{}
+	resumed := &session{deps: &orchestrator.Deps{Client: next, Tlog: s.deps.Tlog}, opts: options{noStream: true, maxSteps: 3}, history: state.History}
+	resumed.converse(context.Background(), orchestrator.RoleAsk, "Continue")
+	if next.taskCalls == 0 {
+		t.Error("bounded automatic reads poisoned short continuation")
+	}
+}
+
+func TestFailedSkillExecutionContextDoesNotPoisonContinuation(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	t.Setenv("OPEN_AGENT_GENERATED_CONTEXT", "")
+	name := "helper-" + strings.Repeat("x", 4990)
+	dir := filepath.Join(root, ".agents", "skills", "helper")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: "+name+"\ndescription: Fixture\n---\nSmall reference."), 0644); err != nil {
+		t.Fatal(err)
+	}
+	initial := &automaticManySkillModel{names: []string{name}}
+	s := &session{deps: &orchestrator.Deps{Client: initial, Tlog: telemetry.Open(filepath.Join(home, "fixture.jsonl"))}, opts: options{noStream: true, maxSteps: 3}}
+	s.converse(context.Background(), orchestrator.RoleAsk, "Investigate evidence")
+	failed := &automaticManySkillModel{}
+	s.deps.Client = failed
+	followup := strings.Repeat("Ordinary evidence. ", 2158)
+	s.converse(context.Background(), orchestrator.RoleAsk, followup)
+	if failed.taskCalls != 0 {
+		t.Error("over-budget follow-up reached task model")
+	}
+	state, ok := loadSession()
+	if !ok {
+		t.Fatal("session missing")
+	}
+	if historyChars(state.History) > historyBudget || strings.Contains(agent.WorkflowContext(state.History), followup) {
+		t.Error("failed execution-context preparation poisoned saved reminder")
+	}
+	next := &automaticManySkillModel{}
+	resumed := &session{deps: &orchestrator.Deps{Client: next, Tlog: s.deps.Tlog}, opts: options{noStream: true, maxSteps: 3}, history: state.History}
+	resumed.converse(context.Background(), orchestrator.RoleAsk, "Continue")
+	if next.taskCalls == 0 {
+		t.Error("failed execution-context preparation blocked short continuation")
 	}
 }

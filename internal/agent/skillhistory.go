@@ -209,13 +209,23 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 		}
 		currentInstruction = original.Instructions
 		a.skillTurn = nil
+		prior := a.skillMemory
 		if !a.skillMemory.rememberInstruction(original.Instructions) {
 			a.skillMu.Unlock()
 			return "", fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
+		reminder, _ := json.Marshal(a.skillMemory)
+		execution, err := skillExecutionContext(catalog, a.skillMemory.Sources)
+		if err != nil || (len(a.skillMemory.Sources) > 0 && len(reminder)+len(execution) > skills.RequiredContextBytes) {
+			a.skillMemory = prior
+			a.skillMu.Unlock()
+			if err != nil {
+				return "", err
+			}
+			return "", fmt.Errorf("required skill execution context exceeds %d bytes", skills.RequiredContextBytes)
+		}
 		a.skillMu.Unlock()
 		prepared := skills.Prepared{Request: original}
-		var err error
 		if inherited {
 			prepared.Names, err = catalog.RequestedNames(original.Instructions)
 		} else {
@@ -244,18 +254,12 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			a.skillMu.Unlock()
 			return "", fmt.Errorf("required skill reference and original instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
-		for _, source := range a.skillMemory.Sources {
-			meta, err := catalog.Resolve(source.Name)
-			if err != nil {
-				continue
-			}
-			dir, err := tools.MountSkillBundle(meta.BaseDir)
-			if err != nil {
-				a.skillMu.Unlock()
-				return "", err
-			}
-			context += fmt.Sprintf("\nSkill %q execution resource directory: %s (task working directory unchanged).", source.Name, dir)
+		execution, err = skillExecutionContext(catalog, a.skillMemory.Sources)
+		if err != nil {
+			a.skillMu.Unlock()
+			return "", err
 		}
+		context += execution
 		if len(a.skillMemory.Sources) > 0 && len(data)+len(context) > skills.RequiredContextBytes {
 			a.skillMemory = previous
 			a.skillMu.Unlock()
@@ -271,12 +275,26 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 		a.skillMu.Lock()
 		defer a.skillMu.Unlock()
 		return a.skillMemory.Requested
-	}, func(view skills.View) {
+	}, func(view skills.View) error {
 		a.skillMu.Lock()
 		defer a.skillMu.Unlock()
+		// Automatic reads must not persist a reminder that makes the next turn
+		// unusable; reject this read while retaining the prior context unchanged.
+		previous := a.skillMemory
 		a.skillMemory.addSource(view.Metadata)
-		if len(a.skillMemory.Instructions) == 0 {
-			a.skillMemory.Instructions = []string{currentInstruction}
+		if !a.skillMemory.rememberInstruction(currentInstruction) {
+			a.skillMemory = previous
+			return fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
+		}
+		reminder, _ := json.Marshal(a.skillMemory)
+		execution, err := skillExecutionContext(catalog, a.skillMemory.Sources)
+		if err != nil {
+			a.skillMemory = previous
+			return err
+		}
+		if len(reminder)+len(execution) > skills.RequiredContextBytes {
+			a.skillMemory = previous
+			return fmt.Errorf("required skill execution context exceeds %d bytes", skills.RequiredContextBytes)
 		}
 		data, _ := json.Marshal(view)
 		context := "Previously read skill reference context:\n" + string(data)
@@ -284,7 +302,24 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			context += skills.CompleteReference(view.Metadata)
 		}
 		a.skillTurn = append(a.skillTurn, llm.Message{Role: "user", Name: "skill_context", Content: context})
+		return nil
 	})
+}
+
+func skillExecutionContext(catalog *skills.Catalog, sources []skillSource) (string, error) {
+	var text strings.Builder
+	for _, source := range sources {
+		meta, err := catalog.Resolve(source.Name)
+		if err != nil {
+			continue
+		}
+		dir, err := tools.MountSkillBundle(meta.BaseDir)
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&text, "\nSkill %q execution resource directory: %s (task working directory unchanged).", source.Name, dir)
+	}
+	return text.String(), nil
 }
 
 // PrepareSkillRequest supplies named bodies to tool-free planning and records
@@ -335,22 +370,34 @@ func CompleteSkillRequest(catalog *skills.Catalog, request skills.Request) (skil
 
 func completeSkillReferences(catalog *skills.Catalog, request skills.Request) (skills.Request, error) {
 	memory, _ := decodeSkillMemory(request.WorkflowContext)
+	updated := memory
+	updated.Sources = nil
 	for _, source := range memory.Sources {
 		if strings.Contains(request.ReferenceContext, skills.CompleteReference(skills.Metadata{Name: source.Name, Source: source.Source})) {
+			updated.addSource(skills.Metadata{Name: source.Name, Source: source.Source, BaseDir: source.BaseDir})
 			continue
 		}
 		meta, err := catalog.Resolve(source.Name)
 		if err != nil {
 			return skills.Request{}, err
 		}
-		if meta.UserOnly && !memory.Requested {
-			return skills.Request{}, fmt.Errorf("skill %q is user-only; it requires a named user request or a helper in a requested workflow", source.Name)
+		if !strings.Contains(request.ReferenceContext, skills.CompleteReference(meta)) {
+			if meta.UserOnly && !memory.Requested {
+				return skills.Request{}, fmt.Errorf("skill %q is user-only; it requires a named user request or a helper in a requested workflow", source.Name)
+			}
+			prior, err := catalog.Prepare(skills.Request{Instructions: "/skill:" + source.Name})
+			if err != nil {
+				return skills.Request{}, err
+			}
+			request.ReferenceContext += prior.Reference
 		}
-		prior, err := catalog.Prepare(skills.Request{Instructions: "/skill:" + source.Name})
-		if err != nil {
-			return skills.Request{}, err
-		}
-		request.ReferenceContext += prior.Reference
+		// A missing body loads the current name resolution. Remember that actual
+		// source so later completion retains its historical bytes without rereading.
+		updated.addSource(meta)
+	}
+	if len(updated.Sources) > 0 {
+		data, _ := json.Marshal(updated)
+		request.WorkflowContext = string(data)
 	}
 	return request, nil
 }

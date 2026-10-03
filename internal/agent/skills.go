@@ -11,7 +11,7 @@ import (
 
 // RegisterSkills adds only named, read-only bundle access. User-only access is
 // supplied by the task's requested workflow, never by automatic discovery.
-func RegisterSkills(reg *Registry, catalog *skills.Catalog, allowUserOnly func() bool, onRead func(skills.View)) {
+func RegisterSkills(reg *Registry, catalog *skills.Catalog, allowUserOnly func() bool, onRead func(skills.View) error) {
 	reg.Register(Tool{
 		Def: schema("skills_list", "List automatically selectable local skills. Follow next_cursor to read the remaining catalog.",
 			obj(props{"cursor": str("Cursor returned by the previous page (optional)")})),
@@ -49,7 +49,9 @@ func RegisterSkills(reg *Registry, catalog *skills.Catalog, allowUserOnly func()
 				return "", fmt.Errorf("skill execution metadata exceeds the view page limit; request a smaller start/end range")
 			}
 			if err == nil && onRead != nil {
-				onRead(view)
+				if err := onRead(view); err != nil {
+					return "", err
+				}
 			}
 			return string(data), err
 		},
