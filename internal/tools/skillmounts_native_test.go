@@ -29,6 +29,9 @@ func TestNativeSelectedSkillMountsEnforceReadonlyThroughEveryPath(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
+	if err := os.Symlink("project,fixture", filepath.Join(root, ".agents", "skills", "alias")); err != nil {
+		t.Fatal(err)
+	}
 	SetSandbox(DockerSandbox{})
 	t.Cleanup(func() { SetSandbox(HostSandbox{}) })
 	alias, err := MountSkillBundle(project)
@@ -51,9 +54,14 @@ func TestNativeSelectedSkillMountsEnforceReadonlyThroughEveryPath(t *testing.T) 
 		if !strings.Contains(out, "fixture evidence") || !strings.Contains(out, "Read-only file system") {
 			t.Fatalf("mount enforcement at %s: %s", path, out)
 		}
+		out = run("if printf changed 2>/tmp/write-error > '" + path + "/read.sh'; then exit 32; fi; cat /tmp/write-error")
+		if !strings.Contains(out, "Read-only file system") {
+			t.Fatalf("script write allowed at %s: %s", path, out)
+		}
 	}
 	check(alias)
 	check("/work/.agents/skills/project,fixture")
+	check("/work/.agents/skills/alias")
 	run("printf writable > /work/unrelated.txt")
 	helperAlias, err := MountSkillBundle(helper)
 	if err != nil {
