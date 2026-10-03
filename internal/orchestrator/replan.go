@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/imhassla/open-agent/internal/agent"
@@ -35,12 +36,20 @@ func DefaultReplanner(ctx context.Context, d *Deps, t Task, failure string) (*Pl
 	if t.Request != nil {
 		request = *t.Request
 	}
-	reference, err := agent.SkillRequestContext(request)
+	catalog, err := planningCatalog()
+	if err != nil {
+		return nil, err
+	}
+	request, reference, err := agent.CompleteSkillRequest(catalog, request)
+	if err != nil {
+		return nil, err
+	}
+	reference, err = planningRequestText(goal, request, reference)
 	if err != nil {
 		return nil, err
 	}
 	rt, _ := d.route(RolePlan)
-	p, err := makePlanWithRoute(ctx, d.Client, rt, goal, nil, request, reference)
+	p, err := makePlanWithRoute(ctx, d.Client, rt, goal, nil, reference)
 	if err != nil {
 		p = singleTaskPlan(goal)
 	}
@@ -55,6 +64,7 @@ func DefaultReplanner(ctx context.Context, d *Deps, t Task, failure string) (*Pl
 // acceptance on the synthesized result before accepting it.
 func runTaskWithReplan(ctx context.Context, d *Deps, t Task, inputs map[string]Artifact, bud *budget.Budget, run Runner, cfg RunConfig, retries int, sem chan struct{}, depth int) (Artifact, error) {
 	art, err := runWithVerify(ctx, d, t, inputs, bud, run, cfg.Verifier, retries)
+	t = taskWithSkillSources(t, art.WorkflowContext)
 	if err == nil || cfg.Replanner == nil || depth >= maxReplanDepth {
 		return art, err
 	}
@@ -68,7 +78,10 @@ func runTaskWithReplan(ctx context.Context, d *Deps, t Task, inputs map[string]A
 	enriched := t
 	enriched.Goal = buildTaskPrompt(t, inputs)
 	sub, perr := cfg.Replanner(ctx, d, enriched, err.Error())
-	if perr != nil || sub == nil || len(sub.Tasks) == 0 {
+	if perr != nil {
+		return art, errors.Join(err, fmt.Errorf("replanning failed: %w", perr))
+	}
+	if sub == nil || len(sub.Tasks) == 0 {
 		return art, err
 	}
 	if verr := sub.Validate(); verr != nil {
@@ -88,6 +101,9 @@ func runTaskWithReplan(ctx context.Context, d *Deps, t Task, inputs map[string]A
 	if sem != nil {
 		sem <- struct{}{}
 	}
+	if sub.Request != nil {
+		art.WorkflowContext = agent.MergeSkillSources(art.WorkflowContext, sub.Request.WorkflowContext)
+	}
 	if subErr != nil {
 		return art, err // replan failed → keep the original failure
 	}
@@ -97,6 +113,9 @@ func runTaskWithReplan(ctx context.Context, d *Deps, t Task, inputs map[string]A
 		return art, err
 	}
 	final.TaskID, final.Role = t.ID, t.Role
+	if sub.Request != nil {
+		final.WorkflowContext = agent.MergeSkillSources(sub.Request.WorkflowContext, final.WorkflowContext)
+	}
 	// Fold the whole sub-plan's spend into the lifted artifact so per-task/per-role
 	// cost attribution isn't under-reported (the budget ledger already had it).
 	final.Tokens, final.Cost = 0, 0

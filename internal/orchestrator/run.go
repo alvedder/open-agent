@@ -105,7 +105,12 @@ func DefaultRunner(ctx context.Context, d *Deps, t Task, inputs map[string]Artif
 		// Carry the worker identity + spend on the error path so runWithVerify can
 		// record this as a rating failure for (role, class, model) — otherwise an
 		// error-prone model is never penalized and the router keeps re-picking it.
-		return Artifact{TaskID: t.ID, Role: t.Role, Model: ag.Model, Tokens: ag.TotalTokens, Cost: ag.TotalCost, WorkflowContext: agent.WorkflowContext(ag.SkillHistory())}, err
+		// Failures before Chat provide no model outcome.
+		model := ag.Model
+		if ag.StepsTaken == 0 {
+			model = ""
+		}
+		return Artifact{TaskID: t.ID, Role: t.Role, Model: model, Tokens: ag.TotalTokens, Cost: ag.TotalCost, WorkflowContext: agent.WorkflowContext(ag.SkillHistory())}, err
 	}
 	return Artifact{
 		WorkflowContext: agent.WorkflowContext(ag.SkillHistory()),
@@ -374,6 +379,13 @@ func runCore(ctx context.Context, d *Deps, p *Plan, bb *Blackboard, bud *budget.
 		inflight--
 		mu.Lock()
 		running[r.id] = false
+		// Failed attempts are not completed artifacts, but their owned reads
+		// still belong to the run's continuing request and saved resume state.
+		if p.Request != nil {
+			request := *p.Request
+			request.WorkflowContext = agent.MergeSkillSources(request.WorkflowContext, r.art.WorkflowContext)
+			p.Request = &request
+		}
 		if r.err != nil {
 			// A genuine cancel/deadline tears the run down: abort, never degrade/skip
 			// (re-dispatching into a dead ctx is unsafe).

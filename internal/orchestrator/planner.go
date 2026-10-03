@@ -86,12 +86,12 @@ func MakePlan(ctx context.Context, d *Deps, goal string) (*Plan, error) {
 }
 
 func MakePlanWithRequest(ctx context.Context, d *Deps, goal string, request skills.Request) (*Plan, error) {
-	request, reference, err := preparePlanningRequest(request)
+	request, reference, err := preparePlanningRequest(goal, request)
 	if err != nil {
 		return nil, err
 	}
 	rt, _ := d.route(RolePlan)
-	if p, err := makePlanWithRoute(ctx, d.Client, rt, goal, nil, request, reference); err == nil {
+	if p, err := makePlanWithRoute(ctx, d.Client, rt, goal, nil, reference); err == nil {
 		p.Request = &request
 		return p, nil
 	}
@@ -104,13 +104,7 @@ func MakePlanWithRequest(ctx context.Context, d *Deps, goal string, request skil
 // system prompt), with a single parse-error repair retry, charging the (nil-safe)
 // budget for each call. It returns an error (rather than the single-task fallback)
 // so callers can distinguish a real plan from a degradation — consensus needs that.
-func makePlanWithRoute(ctx context.Context, client llm.Doer, rt Route, goal string, bud *budget.Budget, request skills.Request, reference string) (*Plan, error) {
-	requestText := reference
-	if strings.TrimSpace(requestText) == "" {
-		requestText = goal
-	} else if goal != request.Instructions {
-		requestText = "Generated planning task and recovery context (original user instructions follow separately):\n" + goal + "\n\n" + reference
-	}
+func makePlanWithRoute(ctx context.Context, client llm.Doer, rt Route, goal string, bud *budget.Budget, requestText string) (*Plan, error) {
 	ask := func(extra string) (*Plan, error) {
 		resp, err := client.Chat(ctx, []llm.Message{
 			{Role: "system", Content: rt.System},
@@ -144,7 +138,7 @@ func MakePlanConsensus(ctx context.Context, d *Deps, goal string, k int, bud *bu
 }
 
 func MakePlanConsensusWithRequest(ctx context.Context, d *Deps, goal string, request skills.Request, k int, bud *budget.Budget) (*Plan, error) {
-	request, reference, err := preparePlanningRequest(request)
+	request, reference, err := preparePlanningRequest(goal, request)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +189,7 @@ func MakePlanConsensusWithRequest(ctx context.Context, d *Deps, goal string, req
 		wg.Add(1)
 		go func(i int, rt Route) {
 			defer wg.Done()
-			if p, err := makePlanWithRoute(ctx, d.Client, rt, goal, bud, request, reference); err == nil {
+			if p, err := makePlanWithRoute(ctx, d.Client, rt, goal, bud, reference); err == nil {
 				plans[i] = p
 			}
 		}(i, rt)

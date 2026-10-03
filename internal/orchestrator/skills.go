@@ -8,18 +8,59 @@ import (
 	"github.com/imhassla/open-agent/internal/skills"
 )
 
-func preparePlanningRequest(request skills.Request) (skills.Request, string, error) {
-	cwd, err := os.Getwd()
+func preparePlanningRequest(goal string, request skills.Request) (skills.Request, string, error) {
+	catalog, err := planningCatalog()
 	if err != nil {
 		return skills.Request{}, "", err
 	}
-	home, err := os.UserHomeDir()
+	request, reference, err := agent.PrepareSkillRequest(catalog, request)
 	if err != nil {
 		return skills.Request{}, "", err
+	}
+	text, err := planningRequestText(goal, request, reference)
+	return request, text, err
+}
+
+// Validate the whole variable payload before any model-failure fallback can
+// hide a required-context error. Fixed planner instructions are outside it.
+func planningRequestText(goal string, request skills.Request, reference string) (string, error) {
+	text := reference
+	if text == "" {
+		text = goal
+	} else if goal != request.Instructions {
+		text = "Generated planning task and recovery context (original user instructions follow separately):\n" + goal + "\n\n" + reference
+	}
+	if (request.ReferenceContext != "" || request.WorkflowContext != "") && len(text) > skills.RequiredContextBytes {
+		return "", fmt.Errorf("required planning context exceeds %d bytes", skills.RequiredContextBytes)
+	}
+	return text, nil
+}
+
+func planningCatalog() (*skills.Catalog, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
 	}
 	catalog := skills.Discover(cwd, home)
 	for _, diagnostic := range catalog.Diagnostics {
 		fmt.Fprintf(os.Stderr, "skills: %s\n", diagnostic)
 	}
-	return agent.PrepareSkillRequest(catalog, request)
+	return catalog, nil
+}
+
+// Retain only owned read metadata from attempts, never their generated output.
+func taskWithSkillSources(t Task, context string) Task {
+	request := skills.Request{}
+	if t.Request != nil {
+		request = *t.Request
+	}
+	request.WorkflowContext = agent.MergeSkillSources(request.WorkflowContext, context)
+	if request.WorkflowContext != "" {
+		t.Request = &request
+	}
+	return t
 }

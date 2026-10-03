@@ -295,17 +295,16 @@ func PrepareSkillRequest(catalog *skills.Catalog, request skills.Request) (skill
 		return skills.Request{}, "", err
 	}
 	memory, _ := decodeSkillMemory(request.WorkflowContext)
-	for _, source := range memory.Sources {
-		if strings.Contains(request.ReferenceContext+prepared.Reference, skills.CompleteReference(skills.Metadata{Name: source.Name, Source: source.Source})) {
-			continue
-		}
-		prior, err := catalog.Prepare(skills.Request{Instructions: "/skill:" + source.Name})
-		if err != nil {
-			return skills.Request{}, "", err
-		}
-		request.ReferenceContext += prior.Reference
-	}
 	if err := memory.rememberRequest(catalog, prepared.Names, request.Instructions); err != nil {
+		return skills.Request{}, "", err
+	}
+	if len(memory.Sources) > 0 {
+		data, _ := json.Marshal(memory)
+		request.WorkflowContext = string(data)
+	}
+	request.ReferenceContext += prepared.Reference
+	request, err = completeSkillReferences(catalog, request)
+	if err != nil {
 		return skills.Request{}, "", err
 	}
 	for _, name := range prepared.Names {
@@ -317,15 +316,43 @@ func PrepareSkillRequest(catalog *skills.Catalog, request skills.Request) (skill
 		if err != nil {
 			return skills.Request{}, "", err
 		}
-		prepared.Reference += fmt.Sprintf("\nSkill %q execution resource directory: %s (task working directory unchanged).", name, dir)
+		request.ReferenceContext += fmt.Sprintf("\nSkill %q execution resource directory: %s (task working directory unchanged).", name, dir)
 	}
-	if len(memory.Sources) > 0 {
-		data, _ := json.Marshal(memory)
-		request.WorkflowContext = string(data)
-	}
-	request.ReferenceContext += prepared.Reference
 	context, err := SkillRequestContext(request)
 	return request, context, err
+}
+
+// CompleteSkillRequest supplies missing instruction bodies for owned source
+// reminders. Complete historical bodies stay unchanged; only absent bodies load.
+func CompleteSkillRequest(catalog *skills.Catalog, request skills.Request) (skills.Request, string, error) {
+	request, err := completeSkillReferences(catalog, request)
+	if err != nil {
+		return skills.Request{}, "", err
+	}
+	context, err := SkillRequestContext(request)
+	return request, context, err
+}
+
+func completeSkillReferences(catalog *skills.Catalog, request skills.Request) (skills.Request, error) {
+	memory, _ := decodeSkillMemory(request.WorkflowContext)
+	for _, source := range memory.Sources {
+		if strings.Contains(request.ReferenceContext, skills.CompleteReference(skills.Metadata{Name: source.Name, Source: source.Source})) {
+			continue
+		}
+		meta, err := catalog.Resolve(source.Name)
+		if err != nil {
+			return skills.Request{}, err
+		}
+		if meta.UserOnly && !memory.Requested {
+			return skills.Request{}, fmt.Errorf("skill %q is user-only; it requires a named user request or a helper in a requested workflow", source.Name)
+		}
+		prior, err := catalog.Prepare(skills.Request{Instructions: "/skill:" + source.Name})
+		if err != nil {
+			return skills.Request{}, err
+		}
+		request.ReferenceContext += prior.Reference
+	}
+	return request, nil
 }
 
 // SkillRequestContext renders already-owned context without reloading historical

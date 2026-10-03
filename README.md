@@ -174,10 +174,14 @@ does not refresh loaded bytes; another actual read uses current files.
 `do` planners receive named reference bodies before decomposition and retain the
 original request separately from their generated goals. Workers and spawned
 children inherit request intent and source reminders, loading bodies/helpers
-as needed. Interactive `/do` carries the continuing context; `do --resume`
-restores the saved request and reference context. Judges retain their existing
-independent evaluation criteria. Required planning context that cannot fit
-fails clearly.
+as needed. Reads from failed attempts survive retries, replanning and saved-run
+resume; failed tasks remain unfinished. Replanners receive missing instruction
+bodies while preserving complete historical bodies. Interactive `/do` carries
+the continuing context; `do --resume` restores the saved request and references.
+Judges retain their independent criteria; judges, compaction and bulk calls get
+no automatic skill catalog. Code-consensus callers include relevant requirements
+in their existing prompt. Required planning context, including recovery text,
+that cannot fit fails clearly.
 
 Scheduled `code`, `ask`, `research` and `do` tasks invoke skills from any position
 in their saved instructions. Upstream chain output travels as generated context

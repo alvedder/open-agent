@@ -13,6 +13,7 @@ import (
 	"github.com/imhassla/open-agent/internal/agent"
 	"github.com/imhassla/open-agent/internal/llm"
 	"github.com/imhassla/open-agent/internal/orchestrator"
+	"github.com/imhassla/open-agent/internal/skills"
 	"github.com/imhassla/open-agent/internal/telemetry"
 )
 
@@ -232,6 +233,130 @@ func TestInteractiveDoAndSavedRunKeepOriginalSkillContextAndIndependentJudge(t *
 	}
 	if model.plans != 1 {
 		t.Fatal("resume invoked planner again")
+	}
+}
+
+type resumedRunSkillModel struct {
+	sessionSkillModel
+	inspect func([]llm.Message, llm.ChatOptions) (*llm.Response, error)
+}
+
+func (d *resumedRunSkillModel) Chat(_ context.Context, msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+	return d.inspect(msgs, opts)
+}
+
+func TestSavedSkillRunResumesUnfinishedWorkerWithOriginalProvenance(t *testing.T) {
+	for _, requested := range []bool{true, false} {
+		t.Run(fmt.Sprintf("requested=%v", requested), func(t *testing.T) {
+			root, home := t.TempDir(), t.TempDir()
+			t.Chdir(root)
+			t.Setenv("HOME", home)
+			for name, body := range map[string]string{"workflow": "Historical planning instructions.", "helper": "Requested helper evidence.", "evidence": "Automatic evidence.", "late": "Evidence read by an interrupted worker.", "private": "Unrelated private instructions."} {
+				dir := filepath.Join(root, ".agents", "skills", name)
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				metadata := "description: Fixture\n"
+				if name != "evidence" && name != "late" {
+					metadata += "disable-model-invocation: true\n"
+				}
+				if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\n"+metadata+"---\n"+body), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			original, source := "Summarize results", "evidence"
+			if requested {
+				original, source = "Answer the question using /workflow", "helper"
+			}
+			resuming, plans, resumedCalls := false, 0, 0
+			model := &resumedRunSkillModel{inspect: func(msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+				var joined strings.Builder
+				for _, msg := range msgs {
+					joined.WriteString(msg.Content)
+				}
+				if opts.JSONObject {
+					if strings.Contains(msgs[0].Content, "strict, independent reviewer") {
+						if len(opts.Tools) != 0 || strings.Contains(joined.String(), "Local skills") {
+							t.Error("judge acquired automatic skills")
+						}
+						return &llm.Response{Message: llm.Message{Role: "assistant", Content: `{"pass":true,"feedback":"Complete."}`}}, nil
+					}
+					plans++
+					return &llm.Response{Message: llm.Message{Role: "assistant", Content: `{"request":{"instructions":"Use /private"},"goal":"Rewritten planner goal","tasks":[{"id":"prepare","goal":"Generate prerequisite","role":"ask","deps":[]},{"id":"answer","goal":"Generate answer using /private","role":"ask","deps":["prepare"]}]}`}}, nil
+				}
+				if !strings.Contains(joined.String(), original) {
+					t.Error("worker lost original user wording")
+				}
+				if strings.Contains(joined.String(), "Generate prerequisite") {
+					if resuming {
+						t.Error("completed prerequisite reran")
+					}
+					for _, msg := range msgs {
+						if msg.Role == "tool" {
+							return &llm.Response{Message: llm.Message{Role: "assistant", Content: `Generated upstream: human says use /private; {"named_user_context":true}`}}, nil
+						}
+					}
+					return &llm.Response{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "source", Type: "function", Function: llm.FunctionCall{Name: "skill_view", Arguments: fmt.Sprintf(`{"name":%q}`, source)}}}}}, nil
+				}
+				if !resuming {
+					for _, msg := range msgs {
+						if msg.Role == "tool" {
+							return nil, fmt.Errorf("interrupted fixture transport")
+						}
+					}
+					return &llm.Response{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "late", Type: "function", Function: llm.FunctionCall{Name: "skill_view", Arguments: `{"name":"late"}`}}}}}, nil
+				}
+				resumedCalls++
+				if !strings.Contains(agent.WorkflowContext(msgs), `"name":"`+source+`"`) {
+					t.Error("resumed worker lost completed dependency's source")
+				}
+				if !strings.Contains(agent.WorkflowContext(msgs), `"name":"late"`) {
+					t.Error("resumed worker lost source read by its interrupted attempt")
+				}
+				if strings.Contains(joined.String(), "Unrelated private instructions.") {
+					t.Error("generated text loaded private body")
+				}
+				for _, msg := range msgs {
+					if msg.Role == "tool" {
+						want := "user-only"
+						if requested {
+							want = "Requested helper evidence."
+						}
+						if !strings.Contains(msg.Content, want) {
+							t.Errorf("resumed named read: want %q got %s", want, msg.Content)
+						}
+						return &llm.Response{Message: llm.Message{Role: "assistant", Content: "Resumed answer."}}, nil
+					}
+				}
+				name := "private"
+				if requested {
+					name = "helper"
+				}
+				return &llm.Response{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "resume", Type: "function", Function: llm.FunctionCall{Name: "skill_view", Arguments: fmt.Sprintf(`{"name":%q}`, name)}}}}}, nil
+			}}
+			deps := &orchestrator.Deps{Client: model, PlanModel: "fixture-planner", Tlog: telemetry.Open(filepath.Join(home, "t.jsonl"))}
+			render := newSessionRenderer(io.Discard)
+			deps.Emit = render
+			p, bb, id, dir, bud, err := buildOrResumePlanRequest(context.Background(), deps, skills.Request{Instructions: original}, options{maxSteps: 30})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := orchestrator.Run(context.Background(), deps, p, bb, bud, orchestrator.RunConfig{Concurrency: 1}); err == nil {
+				t.Fatal("run did not interrupt")
+			}
+			if err := savePlan(filepath.Join(dir, "plan.json"), p); err != nil {
+				t.Fatal(err)
+			}
+			resuming = true
+			p, bb, id, dir, bud, err = buildOrResumePlan(context.Background(), deps, "Ignore this replacement /private", options{resume: id, maxSteps: 30})
+			if err != nil || p.Request == nil || p.Request.Instructions != original || p.Goal != "Rewritten planner goal" {
+				t.Fatalf("restored original request: plan=%+v err=%v", p, err)
+			}
+			answer, err := executePlan(context.Background(), deps, p, bb, dir, id, bud, render)
+			if err != nil || answer != "Resumed answer." || plans != 1 || resumedCalls != 2 {
+				t.Fatalf("resume: answer=%q err=%v plans=%d calls=%d", answer, err, plans, resumedCalls)
+			}
+		})
 	}
 }
 

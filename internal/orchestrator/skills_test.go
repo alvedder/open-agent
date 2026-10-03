@@ -12,6 +12,7 @@ import (
 	"github.com/imhassla/open-agent/internal/agent"
 	"github.com/imhassla/open-agent/internal/budget"
 	"github.com/imhassla/open-agent/internal/llm"
+	"github.com/imhassla/open-agent/internal/rating"
 	"github.com/imhassla/open-agent/internal/skills"
 	"github.com/imhassla/open-agent/internal/tools"
 )
@@ -400,6 +401,297 @@ func TestVerifyRetriesAndReplanningKeepOriginalSkillRequest(t *testing.T) {
 	}
 	if art, ok := bb.GetArtifact("initial"); !ok || art.Content != "good" {
 		t.Fatalf("replanned result = %+v, %v", art, ok)
+	}
+}
+
+func TestFailedAttemptsCarryReadHelpersThroughRetryAndReplan(t *testing.T) {
+	project, home := t.TempDir(), t.TempDir()
+	t.Chdir(project)
+	t.Setenv("HOME", home)
+	for name, body := range map[string]string{"workflow": "Original planning procedure.", "helper": "Required helper planning instructions."} {
+		dir := filepath.Join(project, ".agents", "skills", name)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Fixture\ndisable-model-invocation: true\n---\n"+body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := "Use /workflow to answer the question"
+	plans, workers := 0, 0
+	model := &inspectSkillModel{inspect: func(msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+		var joined strings.Builder
+		for _, msg := range msgs {
+			joined.WriteString(msg.Content)
+		}
+		if !strings.Contains(joined.String(), original) {
+			t.Error("lost original instructions")
+		}
+		if opts.JSONObject {
+			plans++
+			if len(opts.Tools) > 0 || !strings.Contains(joined.String(), "Original planning procedure.") || strings.Contains(joined.String(), "Changed planning procedure.") {
+				t.Error("planner lost historical body or acquired tools")
+			}
+			id, goal := "initial", "Initial response"
+			if plans > 1 {
+				if !strings.Contains(joined.String(), "Required helper planning instructions.") {
+					t.Error("replanner lost helper read during failed attempt")
+				}
+				id, goal = "alternate", "Alternate response"
+			}
+			return &llm.Response{Message: llm.Message{Role: "assistant", Content: fmt.Sprintf(`{"goal":"Generated goal","tasks":[{"id":%q,"goal":%q,"role":"ask","deps":[]}]}`, id, goal)}}, nil
+		}
+		for _, msg := range msgs {
+			if msg.Role == "tool" && strings.Contains(msg.Content, "Required helper planning instructions.") {
+				file := filepath.Join(project, ".agents", "skills", "workflow", "SKILL.md")
+				if err := os.WriteFile(file, []byte("---\ndescription: Fixture\ndisable-model-invocation: true\n---\nChanged planning procedure."), 0644); err != nil {
+					return nil, err
+				}
+				return &llm.Response{Message: llm.Message{Role: "assistant", Content: "bad"}}, nil
+			}
+		}
+		workers++
+		if workers == 1 {
+			return &llm.Response{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "helper", Type: "function", Function: llm.FunctionCall{Name: "skill_view", Arguments: `{"name":"helper"}`}}}}}, nil
+		}
+		if !strings.Contains(agent.WorkflowContext(msgs), `"name":"helper"`) {
+			t.Error("retry/replanned worker lost helper source")
+		}
+		if strings.Contains(joined.String(), "Required helper planning instructions.") {
+			t.Error("delegated helper body was loaded eagerly")
+		}
+		answer := "bad"
+		if strings.Contains(joined.String(), "Alternate response") {
+			answer = "good"
+		}
+		return &llm.Response{Message: llm.Message{Role: "assistant", Content: answer}}, nil
+	}}
+	d := testDeps(t, model)
+	bud := budget.New(30, 0, 0, 0)
+	p, err := MakePlanConsensusWithRequest(context.Background(), d, original, skills.Request{Instructions: original}, 1, bud)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb := NewBlackboard("")
+	if err := Run(context.Background(), d, p, bb, bud, RunConfig{Concurrency: 1, Verifier: contentVerifier{}, VerifyRetries: 1, Replanner: DefaultReplanner}); err != nil {
+		t.Fatal(err)
+	}
+	if plans != 2 || workers != 3 {
+		t.Fatalf("plans=%d workers=%d; retry/replan path did not execute", plans, workers)
+	}
+	if art, ok := bb.GetArtifact("initial"); !ok || art.Content != "good" || !strings.Contains(art.WorkflowContext, `"name":"helper"`) {
+		t.Fatalf("final artifact lost helper context: %+v", art)
+	}
+}
+
+func TestPlanningRecoveryContextCannotExceedRequiredLimit(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	dir := filepath.Join(".agents", "skills", "workflow")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Fixture\n---\n"+strings.Repeat("Planning instruction.\n", 1500)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	model := &inspectSkillModel{inspect: func(_ []llm.Message, _ llm.ChatOptions) (*llm.Response, error) {
+		calls++
+		return &llm.Response{Message: llm.Message{Role: "assistant", Content: `{"goal":"Generated","tasks":[{"id":"answer","goal":"Answer","role":"ask","deps":[]}]}`}}, nil
+	}}
+	d := testDeps(t, model)
+	p, err := MakePlanWithRequest(context.Background(), d, "Use /workflow", skills.Request{Instructions: "Use /workflow"})
+	if err != nil || calls != 1 {
+		t.Fatalf("initial fitting plan: calls=%d err=%v", calls, err)
+	}
+	largeGoal := strings.Repeat("Generated recovery evidence.\n", 800)
+	continuing := *p.Request
+	continuing.Instructions = "Continue that procedure"
+	for _, path := range []string{"replan", "plan", "consensus", "run"} {
+		t.Run(path, func(t *testing.T) {
+			var err error
+			var plan *Plan
+			wantCalls := calls
+			switch path {
+			case "replan":
+				plan, err = DefaultReplanner(context.Background(), d, Task{ID: "answer", Role: RoleAsk, Goal: largeGoal, Request: p.Request}, "Verification failed")
+			case "plan":
+				plan, err = MakePlanWithRequest(context.Background(), d, largeGoal, continuing)
+			case "consensus":
+				plan, err = MakePlanConsensusWithRequest(context.Background(), d, largeGoal, continuing, 1, budget.New(20, 0, 0, 0))
+			case "run":
+				recovery := *p
+				recovery.Tasks = append([]Task(nil), p.Tasks...)
+				recovery.Tasks[0].Goal = largeGoal
+				err = Run(context.Background(), d, &recovery, NewBlackboard(""), budget.New(20, 0, 0, 0), RunConfig{Concurrency: 1, Verifier: contentVerifier{}, VerifyRetries: 1, Replanner: DefaultReplanner})
+				wantCalls += 2 // original worker and verification retry; no planner
+			}
+			if err == nil || !strings.Contains(err.Error(), "planning context exceeds 48000 bytes") || plan != nil {
+				t.Fatalf("oversized recovery did not fail clearly: plan=%+v err=%v", plan, err)
+			}
+			if calls != wantCalls {
+				t.Fatalf("oversized recovery made a model call: %d", calls)
+			}
+		})
+	}
+}
+
+func TestFailedReplanRetainsReadSourcesInOwningRun(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	for _, name := range []string{"workflow", "late"} {
+		dir := filepath.Join(".agents", "skills", name)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Fixture\n---\n"+name+" instructions."), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plans, lateReads := 0, 0
+	model := &inspectSkillModel{inspect: func(msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+		if opts.JSONObject {
+			plans++
+			goal := "Initial response"
+			if plans > 1 {
+				goal = "Alternate response"
+			}
+			return &llm.Response{Message: llm.Message{Role: "assistant", Content: fmt.Sprintf(`{"goal":"Generated","tasks":[{"id":"answer","goal":%q,"role":"ask","deps":[]}]}`, goal)}}, nil
+		}
+		var joined strings.Builder
+		for _, msg := range msgs {
+			joined.WriteString(msg.Content)
+			if msg.Role == "tool" && strings.Contains(msg.Content, "late instructions.") {
+				lateReads++
+				return nil, fmt.Errorf("alternate worker transport failed")
+			}
+		}
+		if strings.Contains(joined.String(), "Alternate response") {
+			return &llm.Response{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "late", Type: "function", Function: llm.FunctionCall{Name: "skill_view", Arguments: `{"name":"late"}`}}}}}, nil
+		}
+		return &llm.Response{Message: llm.Message{Role: "assistant", Content: "bad"}}, nil
+	}}
+	d := testDeps(t, model)
+	p, err := MakePlanWithRequest(context.Background(), d, "Use /workflow", skills.Request{Instructions: "Use /workflow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb := NewBlackboard("")
+	err = Run(context.Background(), d, p, bb, budget.New(20, 0, 0, 0), RunConfig{Concurrency: 1, Verifier: contentVerifier{}, VerifyRetries: 1, Replanner: DefaultReplanner})
+	if err == nil || plans != 2 || lateReads != 1 || len(bb.Snapshot()) != 0 {
+		t.Fatalf("failed nested attempt did not execute: plans=%d reads=%d artifacts=%d err=%v", plans, lateReads, len(bb.Snapshot()), err)
+	}
+	if !strings.Contains(p.Request.WorkflowContext, `"name":"late"`) {
+		t.Fatal("owning run lost the failed replanned worker's source")
+	}
+}
+
+func TestReplanMissingBodyCannotCreateUserOnlyEligibility(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	dir := filepath.Join(".agents", "skills", "automatic")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(file, []byte("---\ndescription: Fixture\n---\nAutomatic procedure."), 0644); err != nil {
+		t.Fatal(err)
+	}
+	plans, workers := 0, 0
+	model := &inspectSkillModel{inspect: func(msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+		if opts.JSONObject {
+			plans++
+			return &llm.Response{Message: llm.Message{Role: "assistant", Content: `{"goal":"Generated","tasks":[{"id":"answer","goal":"Answer","role":"ask","deps":[]}]}`}}, nil
+		}
+		for _, msg := range msgs {
+			if msg.Role == "tool" {
+				if err := os.WriteFile(file, []byte("---\ndescription: Fixture\ndisable-model-invocation: true\n---\nNow user-only procedure."), 0644); err != nil {
+					return nil, err
+				}
+				return &llm.Response{Message: llm.Message{Role: "assistant", Content: "bad"}}, nil
+			}
+		}
+		workers++
+		if workers == 1 {
+			return &llm.Response{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "automatic", Type: "function", Function: llm.FunctionCall{Name: "skill_view", Arguments: `{"name":"automatic"}`}}}}}, nil
+		}
+		return &llm.Response{Message: llm.Message{Role: "assistant", Content: "bad"}}, nil
+	}}
+	d := testDeps(t, model)
+	p, err := MakePlanWithRequest(context.Background(), d, "Answer question", skills.Request{Instructions: "Answer question"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Run(context.Background(), d, p, NewBlackboard(""), budget.New(20, 0, 0, 0), RunConfig{Concurrency: 1, Verifier: contentVerifier{}, VerifyRetries: 1, Replanner: DefaultReplanner})
+	if err == nil || !strings.Contains(err.Error(), "user-only") || plans != 1 || workers != 2 {
+		t.Fatalf("missing-body replan authorized a new user-only read: plans=%d workers=%d err=%v", plans, workers, err)
+	}
+}
+
+func TestDelegatedSkillPreparationDoesNotRateAnUncalledModel(t *testing.T) {
+	for _, outcome := range []string{"missing_skill", "model_error", "success"} {
+		t.Run(outcome, func(t *testing.T) {
+			project, home := t.TempDir(), t.TempDir()
+			t.Chdir(project)
+			t.Setenv("HOME", home)
+			dir := filepath.Join(project, ".agents", "skills", "workflow")
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			file := filepath.Join(dir, "SKILL.md")
+			if err := os.WriteFile(file, []byte("---\ndescription: Fixture\n---\nProcedure instructions."), 0644); err != nil {
+				t.Fatal(err)
+			}
+			workerCalls := 0
+			model := &inspectSkillModel{inspect: func(_ []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+				if opts.JSONObject {
+					return &llm.Response{Message: llm.Message{Role: "assistant", Content: `{"goal":"Generated","tasks":[{"id":"answer","goal":"Answer","role":"ask","deps":[]}]}`}}, nil
+				}
+				workerCalls++
+				if outcome == "model_error" {
+					return nil, fmt.Errorf("zero-cost model transport failure")
+				}
+				return &llm.Response{Message: llm.Message{Role: "assistant", Content: "good"}}, nil
+			}}
+			d := testDeps(t, model)
+			d.Rating = rating.Open(filepath.Join(home, "ratings.json"))
+			worker, err := BuildWorker(RoleAsk, d, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := MakePlanWithRequest(context.Background(), d, "Use /workflow", skills.Request{Instructions: "Use /workflow"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if outcome == "missing_skill" {
+				if err := os.Remove(file); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = Run(context.Background(), d, p, NewBlackboard(""), budget.New(10, 0, 0, 0), RunConfig{Concurrency: 1, Verifier: contentVerifier{}})
+			stat, rated := rating.Open(filepath.Join(home, "ratings.json")).Get("ask", worker.Model)
+			if outcome == "missing_skill" {
+				if err == nil || !strings.Contains(err.Error(), "unavailable") || workerCalls != 0 {
+					t.Fatalf("missing skill: calls=%d err=%v", workerCalls, err)
+				}
+				if rated {
+					t.Fatalf("uncalled model was rated: %+v", stat)
+				}
+				return
+			}
+			wantRate := 1.0
+			if outcome == "model_error" {
+				wantRate = 0
+				if err == nil || !strings.Contains(err.Error(), "zero-cost model transport failure") {
+					t.Fatalf("model failure not surfaced: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if workerCalls != 1 || !rated || stat.Samples != 1 || stat.PassRate != wantRate {
+				t.Fatalf("actual model outcome lost: calls=%d rated=%v stat=%+v", workerCalls, rated, stat)
+			}
+		})
 	}
 }
 
