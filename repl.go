@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -489,7 +490,10 @@ func (s *session) orchestrate(ctx context.Context, line string) {
 	request := skills.Request{Instructions: line, WorkflowContext: agent.WorkflowContext(s.history), ReferenceContext: references.String()}
 	plan, bb, runID, dir, bud, err := buildOrResumePlanRequest(ctx, s.deps, request, s.opts)
 	if err != nil {
+		reminder, reminderErr := agent.RememberSkillInstruction(request.WorkflowContext, line)
+		err = errors.Join(err, reminderErr)
 		fmt.Fprintln(os.Stderr, err)
+		s.foldHistory(line, fmt.Sprintf("(planning failed: %v)", err), agent.WithSkillReminder(nil, reminder)...)
 		return
 	}
 	// Account for the run budget on EVERY exit after planning — planning (the

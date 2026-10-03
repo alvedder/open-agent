@@ -271,3 +271,134 @@ func TestSessionCompactionRetainsSkillSourcesAndLaterStopEvenIfSummaryOmitsThem(
 		}
 	}
 }
+
+func TestFailedSkillStopSurvivesCompactionAndContinuation(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	dir := filepath.Join(root, ".agents", "skills", "workflow")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "SKILL.md")
+	if err := os.WriteFile(file, []byte("---\ndescription: Workflow\n---\nHistorical workflow instructions"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name          string
+		planning      bool
+		failedSummary bool
+	}{
+		{name: "conversation_lossy_summary"},
+		{name: "conversation_failed_summary", failedSummary: true},
+		{name: "planning_lossy_summary", planning: true},
+		{name: "planning_failed_summary", planning: true, failedSummary: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Load the workflow, then make the named reference unavailable before
+			// the stop turn. The failed turn still carries the user's latest intent.
+			if err := os.WriteFile(file, []byte("---\ndescription: Workflow\n---\nHistorical workflow instructions"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			model := &sessionSkillModel{}
+			s := &session{deps: &orchestrator.Deps{Client: model, Tlog: telemetry.Open(filepath.Join(t.TempDir(), "t.jsonl"))}, opts: options{noStream: true}}
+			s.converse(context.Background(), orchestrator.RoleAsk, "Use /workflow")
+			if err := os.Remove(file); err != nil {
+				t.Fatal(err)
+			}
+			if tc.planning {
+				s.orchestrate(context.Background(), "Stop using /workflow")
+			} else {
+				s.converse(context.Background(), orchestrator.RoleAsk, "Stop using /workflow")
+			}
+			if len(model.seen) != 1 {
+				t.Fatal("unavailable named skill should fail before a model call")
+			}
+			s.history = append(s.history, bigHistory(40)...)
+			summary := &summarizeDoer{summary: "A summary omitting all skill intent."}
+			if tc.failedSummary {
+				summary.err = fmt.Errorf("summary unavailable")
+			}
+			s.deps.Client = summary
+			s.compactHistory()
+			if err := saveSession(s); err != nil {
+				t.Fatal(err)
+			}
+			state, ok := loadSession()
+			if !ok {
+				t.Fatal("compacted conversation was not persisted")
+			}
+			resumedModel := &sessionSkillModel{}
+			resumed := &session{deps: &orchestrator.Deps{Client: resumedModel, Tlog: s.deps.Tlog}, opts: options{noStream: true}, history: state.History}
+			resumed.converse(context.Background(), orchestrator.RoleAsk, "What should we do next?")
+			if len(resumedModel.seen) != 1 {
+				t.Fatal("continuation did not reach the model")
+			}
+			reminder := agent.WorkflowContext(resumedModel.seen[0])
+			use, stop := strings.Index(reminder, "Use /workflow"), strings.Index(reminder, "Stop using /workflow")
+			if use < 0 || stop <= use {
+				t.Fatalf("continuation lost the later stop: %s", reminder)
+			}
+		})
+	}
+}
+
+func TestOversizedSkillFollowupDoesNotPreventContinuation(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	dir := filepath.Join(root, ".agents", "skills", "workflow")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Workflow\n---\nFixture instructions"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name        string
+		planning    bool
+		unavailable bool
+	}{
+		{name: "conversation"},
+		{name: "planning", planning: true},
+		{name: "planning_unavailable_skill", planning: true, unavailable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &session{deps: &orchestrator.Deps{Client: &sessionSkillModel{}, Tlog: telemetry.Open(filepath.Join(t.TempDir(), "t.jsonl"))}, opts: options{noStream: true}}
+			s.converse(context.Background(), orchestrator.RoleAsk, "Use /workflow")
+			oversized := strings.Repeat("Oversized follow-up text. ", 4000)
+			if tc.unavailable {
+				oversized = "Stop using /skill:missing. " + oversized
+				stderr, err := os.CreateTemp(t.TempDir(), "stderr")
+				if err != nil {
+					t.Fatal(err)
+				}
+				priorStderr := os.Stderr
+				os.Stderr = stderr
+				defer func() { os.Stderr = priorStderr; _ = stderr.Close() }()
+				s.orchestrate(context.Background(), oversized)
+				data, err := os.ReadFile(stderr.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(string(data), "unavailable") || !strings.Contains(string(data), "context exceeds 48000 bytes") {
+					t.Fatalf("missing-skill failure hid required-context overflow: %s", data)
+				}
+			} else if tc.planning {
+				s.orchestrate(context.Background(), oversized)
+			} else {
+				s.converse(context.Background(), orchestrator.RoleAsk, oversized)
+			}
+			state, ok := loadSession()
+			if !ok || historyChars(state.History) > historyBudget {
+				t.Fatalf("failed turn left persisted context oversized: %d bytes", historyChars(state.History))
+			}
+			model := &sessionSkillModel{}
+			resumed := &session{deps: &orchestrator.Deps{Client: model, Tlog: s.deps.Tlog}, opts: options{noStream: true}, history: state.History}
+			resumed.converse(context.Background(), orchestrator.RoleAsk, "Continue that procedure")
+			if len(model.seen) != 1 || !strings.Contains(agent.WorkflowContext(model.seen[0]), "Use /workflow") {
+				t.Fatal("oversized failed input prevented continuation of the prior workflow")
+			}
+		})
+	}
+}

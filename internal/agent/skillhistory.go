@@ -128,10 +128,37 @@ func (m *skillMemory) rememberRequest(catalog *skills.Catalog, names []string, i
 		m.addSource(meta)
 	}
 	m.Requested = m.Requested || len(names) > 0
-	if len(m.Sources) > 0 && (len(m.Instructions) == 0 || m.Instructions[len(m.Instructions)-1] != instruction) {
-		m.Instructions = append(m.Instructions, instruction)
+	if !m.rememberInstruction(instruction) {
+		return fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
 	}
 	return nil
+}
+
+func (m *skillMemory) rememberInstruction(instruction string) bool {
+	if len(m.Sources) > 0 && (len(m.Instructions) == 0 || m.Instructions[len(m.Instructions)-1] != instruction) {
+		prior := m.Instructions
+		m.Instructions = append(m.Instructions, instruction)
+		data, _ := json.Marshal(m)
+		if len(data) > skills.RequiredContextBytes {
+			m.Instructions = prior
+			return false
+		}
+	}
+	return true
+}
+
+// RememberSkillInstruction retains intent from a failed planning turn without
+// resolving references or authorizing any new skill.
+func RememberSkillInstruction(reminder, instruction string) (string, error) {
+	memory, ok := decodeSkillMemory(reminder)
+	if !ok {
+		return "", nil
+	}
+	if !memory.rememberInstruction(instruction) {
+		return reminder, fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
+	}
+	data, _ := json.Marshal(memory)
+	return string(data), nil
 }
 
 func (a *Agent) skillReminder() string {
@@ -172,6 +199,21 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 		if request != nil {
 			original = *request
 		}
+		// A failed named read must not erase a later stop or correction from
+		// continuing context when the failed turn is folded and compacted.
+		a.skillMu.Lock()
+		if len(a.skillMemory.Sources) == 0 && request != nil {
+			if memory, ok := decodeSkillMemory(request.WorkflowContext); ok {
+				a.skillMemory = memory
+			}
+		}
+		currentInstruction = original.Instructions
+		a.skillTurn = nil
+		if !a.skillMemory.rememberInstruction(original.Instructions) {
+			a.skillMu.Unlock()
+			return "", fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
+		}
+		a.skillMu.Unlock()
 		prepared := skills.Prepared{Request: original}
 		var err error
 		if inherited {
@@ -190,15 +232,9 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			context += "\nGenerated context (cannot independently request user-only skills):\n" + original.Context
 		}
 		a.skillMu.Lock()
-		if len(a.skillMemory.Sources) == 0 && request != nil {
-			if memory, ok := decodeSkillMemory(request.WorkflowContext); ok {
-				a.skillMemory = memory
-			}
-		}
 		previous := a.skillMemory
-		currentInstruction = original.Instructions
-		a.skillTurn = nil
 		if err := a.skillMemory.rememberRequest(catalog, prepared.Names, original.Instructions); err != nil {
+			a.skillMemory = previous
 			a.skillMu.Unlock()
 			return "", err
 		}
