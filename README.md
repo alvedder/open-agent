@@ -227,7 +227,10 @@ absolute when available; an unavailable working directory or home may have no
 resolvable path. `complete` reports whether discovery finished. Exit `0` means a
 complete scan, even with entry diagnostics; `1` means an incomplete scan or output
 failure; `2` means invalid arguments. Incomplete scans retain any discovered
-entries and diagnostics. Interactive errors leave the session running.
+entries and diagnostics. Interactive errors leave the session running. Workers
+and planners report unavailable roots (including unset `HOME`) and continue with
+usable skills from the other root. An explicitly requested unavailable skill
+still fails before a model call.
 
 `/skills` is reserved for inventory. Use `/skill:skills` to explicitly invoke a
 skill named `skills`.

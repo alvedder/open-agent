@@ -845,3 +845,156 @@ func TestSkillDiscoveryDiagnosticsCannotControlTerminal(t *testing.T) {
 		})
 	}
 }
+
+func TestMissingHomeDoesNotBlockWorkersOrPlanners(t *testing.T) {
+	for _, named := range []bool{false, true} {
+		for _, mode := range []string{"ask", "code", "research", "planner", "consensus", "replanner"} {
+			t.Run(fmt.Sprintf("%s/named=%t", mode, named), func(t *testing.T) {
+				root := t.TempDir()
+				t.Chdir(root)
+				t.Setenv("HOME", "")
+				if err := os.Unsetenv("HOME"); err != nil {
+					t.Fatal(err)
+				}
+				dir := filepath.Join(root, ".agents", "skills", "workflow")
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Project workflow\ndisable-model-invocation: true\n---\nProject procedure evidence."), 0644); err != nil {
+					t.Fatal(err)
+				}
+				called := false
+				model := &inspectSkillModel{inspect: func(msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+					called = true
+					var text strings.Builder
+					for _, m := range msgs {
+						text.WriteString(m.Content)
+					}
+					if named && !strings.Contains(text.String(), "Project procedure evidence.") {
+						t.Errorf("project skill lost when home unavailable")
+						return nil, fmt.Errorf("project skill lost when home unavailable")
+					}
+					body := "Answered without a home directory."
+					if opts.JSONObject {
+						body = `{"goal":"answer","tasks":[{"id":"answer","goal":"answer","role":"ask","deps":[]}]}`
+					}
+					return &llm.Response{Message: llm.Message{Role: "assistant", Content: body}}, nil
+				}}
+				d := testDeps(t, model)
+				capture, err := os.CreateTemp(t.TempDir(), "stderr")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer capture.Close()
+				previous := os.Stderr
+				os.Stderr = capture
+				defer func() { os.Stderr = previous }()
+				goal := "Explain the task"
+				if named {
+					goal = "Explain /workflow"
+				}
+				request := skills.Request{Instructions: goal}
+				switch mode {
+				case "planner":
+					_, err = MakePlanWithRequest(context.Background(), d, goal, request)
+				case "consensus":
+					_, err = MakePlanConsensusWithRequest(context.Background(), d, goal, request, 1, nil)
+				case "replanner":
+					if named {
+						// Real replans inherit owned source reminders from the failed worker.
+						// Drop body text to prove completion hydrates it before model planning.
+						request, _, err = agent.PrepareSkillRequest(skills.Discover(root, ""), request)
+						if err != nil {
+							t.Fatal(err)
+						}
+						request.ReferenceContext = ""
+					}
+					_, err = DefaultReplanner(context.Background(), d, Task{ID: "task", Goal: goal, Role: RoleAsk, Request: &request}, "retry")
+				default:
+					var worker *agent.Agent
+					worker, err = BuildWorker(Role(mode), d, Options{MaxSteps: 2})
+					if err == nil {
+						_, err = worker.Run(context.Background(), goal)
+					}
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !called {
+					t.Fatal("model was not reached")
+				}
+				data, err := os.ReadFile(capture.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(string(data), "skills:") || !strings.Contains(string(data), "HOME") {
+					t.Fatalf("missing diagnostic: %q", data)
+				}
+			})
+		}
+	}
+}
+
+func TestMissingHomeStillRejectsUnavailableNamedSkill(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", "")
+	model := &inspectSkillModel{inspect: func(_ []llm.Message, _ llm.ChatOptions) (*llm.Response, error) {
+		t.Fatal("unavailable requested skill reached model")
+		return nil, nil
+	}}
+	d := testDeps(t, model)
+	goal := "Use /missing-procedure"
+	worker, err := BuildWorker(RoleAsk, d, Options{MaxSteps: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = worker.Run(context.Background(), goal); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("worker missing skill error: %v", err)
+	}
+	if _, err = MakePlanWithRequest(context.Background(), d, goal, skills.Request{Instructions: goal}); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("planner missing skill error: %v", err)
+	}
+}
+
+func TestUnavailableWorkingDirectoryKeepsPersonalSkillsForTasks(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".agents", "skills", "personal")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Personal skill\n---\nPersonal reference evidence."), 0644); err != nil {
+		t.Fatal(err)
+	}
+	model := &inspectSkillModel{inspect: func(msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+		var text strings.Builder
+		for _, m := range msgs {
+			text.WriteString(m.Content)
+		}
+		if !strings.Contains(text.String(), "Personal reference evidence.") {
+			t.Errorf("personal reference lost")
+			return nil, fmt.Errorf("personal reference lost")
+		}
+		body := "Personal reference retained."
+		if opts.JSONObject {
+			body = `{"goal":"answer","tasks":[{"id":"answer","goal":"answer","role":"ask","deps":[]}]}`
+		}
+		return &llm.Response{Message: llm.Message{Role: "assistant", Content: body}}, nil
+	}}
+	d := testDeps(t, model)
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	goal := "Explain /personal"
+	worker, err := BuildWorker(RoleAsk, d, Options{MaxSteps: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = worker.Run(context.Background(), goal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = MakePlanWithRequest(context.Background(), d, goal, skills.Request{Instructions: goal}); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -32,6 +32,17 @@ type Catalog struct {
 	incomplete  bool
 }
 
+// DiscoverCurrent scans the default roots independently. An unavailable home
+// or working directory is a diagnostic, not a fatal prerequisite for a task.
+func DiscoverCurrent() *Catalog {
+	home, err := os.UserHomeDir()
+	catalog := Discover(".", home)
+	if err != nil {
+		catalog.diagnose("filesystem", nil, "personal skill root unavailable: %v", err)
+	}
+	return catalog
+}
+
 // Discover uses the nearest .git directory/file above cwd, or cwd outside Git,
 // and the user's home. Catalogs belong to a workspace, not a shared model client.
 func Discover(cwd, home string) *Catalog {

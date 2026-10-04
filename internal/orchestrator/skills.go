@@ -9,10 +9,7 @@ import (
 )
 
 func preparePlanningRequest(goal string, request skills.Request) (skills.Request, string, error) {
-	catalog, err := planningCatalog()
-	if err != nil {
-		return skills.Request{}, "", err
-	}
+	catalog := discoverSkillCatalog()
 	prepared, err := agent.PlanSkillRequest(catalog, request)
 	if err != nil {
 		return skills.Request{}, "", err
@@ -40,20 +37,12 @@ func planningRequestText(goal string, request skills.Request, reference string) 
 	return text, nil
 }
 
-func planningCatalog() (*skills.Catalog, error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return nil, err
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	catalog := skills.Discover(cwd, home)
+func discoverSkillCatalog() *skills.Catalog {
+	catalog := skills.DiscoverCurrent()
 	for _, diagnostic := range catalog.Diagnostics {
 		fmt.Fprintf(os.Stderr, "skills: %s\n", skills.TerminalText(diagnostic))
 	}
-	return catalog, nil
+	return catalog
 }
 
 // Retain only owned read metadata from attempts, never their generated output.

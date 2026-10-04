@@ -205,18 +205,7 @@ func BuildWorker(role Role, d *Deps, o Options) (*agent.Agent, error) {
 	reg := RegistryFor(role, d, o.Budget)
 	var catalog *skills.Catalog
 	if role == RoleAsk || role == RoleCode || role == RoleResearch {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return nil, fmt.Errorf("skill discovery working directory: %w", err)
-		}
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("skill discovery home: %w", err)
-		}
-		catalog = skills.Discover(cwd, home)
-		for _, diagnostic := range catalog.Diagnostics {
-			fmt.Fprintf(os.Stderr, "skills: %s\n", skills.TerminalText(diagnostic))
-		}
+		catalog = discoverSkillCatalog()
 		page, err := catalog.List("")
 		if err != nil {
 			return nil, err

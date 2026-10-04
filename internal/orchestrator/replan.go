@@ -36,10 +36,7 @@ func DefaultReplanner(ctx context.Context, d *Deps, t Task, failure string) (*Pl
 	if t.Request != nil {
 		request = *t.Request
 	}
-	catalog, err := planningCatalog()
-	if err != nil {
-		return nil, err
-	}
+	catalog := discoverSkillCatalog()
 	request, reference, err := agent.CompleteSkillRequest(catalog, request)
 	if err != nil {
 		return nil, err
@@ -81,10 +78,7 @@ func runTaskWithReplan(ctx context.Context, d *Deps, t Task, inputs map[string]A
 	// same source identity into its children. Never trust model-generated request
 	// fields, and do not discard provenance from an actual instruction reload.
 	if enriched.Request != nil && enriched.Request.WorkflowContext != "" {
-		catalog, perr := planningCatalog()
-		if perr != nil {
-			return art, errors.Join(err, fmt.Errorf("replanning failed: %w", perr))
-		}
+		catalog := discoverSkillCatalog()
 		request, _, perr := agent.CompleteSkillRequest(catalog, *enriched.Request)
 		if perr != nil {
 			return art, errors.Join(err, fmt.Errorf("replanning failed: %w", perr))

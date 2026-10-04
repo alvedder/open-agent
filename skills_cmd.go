@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"unicode/utf8"
 
@@ -63,7 +62,7 @@ func runSkillInventory(args []string, out, stderr io.Writer, allowJSON bool) int
 		flags.Usage()
 		return 2
 	}
-	inventory := discoverSkillInventory()
+	inventory := skills.DiscoverCurrent().Inventory()
 	var err error
 	if jsonOut {
 		err = json.NewEncoder(out).Encode(inventory)
@@ -78,18 +77,6 @@ func runSkillInventory(args []string, out, stderr io.Writer, allowJSON bool) int
 		return 1
 	}
 	return 0
-}
-
-func discoverSkillInventory() skills.Inventory {
-	home, err := os.UserHomeDir()
-	// Discover resolves the cwd and still scans the personal root if resolution
-	// fails. Avoid an outer Getwd gate that discards those partial results.
-	result := skills.Discover(".", home).Inventory()
-	if err != nil {
-		result.Complete = false
-		result.Diagnostics = append(result.Diagnostics, skills.Diagnostic{Category: "filesystem", Message: err.Error(), Paths: []string{}})
-	}
-	return result
 }
 
 func formatSkillInventory(inventory skills.Inventory, verbose bool) string {

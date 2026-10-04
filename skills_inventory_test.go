@@ -478,3 +478,25 @@ func TestSkillInventoryScanLimitReportsPartialResults(t *testing.T) {
 		t.Fatalf("missing limit diagnostic: %+v", inventory.Diagnostics)
 	}
 }
+
+func TestSkillInventoryMissingHomeRetainsProjectResults(t *testing.T) {
+	root := t.TempDir()
+	inventoryBundle(t, root, "project", "description: Project skill")
+	out, stderr, code := inventoryCommand(t, root, "", "skills", "list", "--json")
+	var inventory skills.Inventory
+	if err := json.Unmarshal([]byte(out), &inventory); err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 || inventory.Complete || len(inventory.Skills) != 1 || inventory.Skills[0].Name != "project" {
+		t.Fatalf("exit=%d stderr=%s result=%+v", code, stderr, inventory)
+	}
+	found := false
+	for _, d := range inventory.Diagnostics {
+		if d.Category == "filesystem" && strings.Contains(d.Message, "HOME") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing unavailable-home diagnostic: %+v", inventory.Diagnostics)
+	}
+}
