@@ -800,3 +800,48 @@ func TestWorkersSelectAndReadSkillsWithoutChangingRoleTools(t *testing.T) {
 		})
 	}
 }
+
+func TestSkillDiscoveryDiagnosticsCannotControlTerminal(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	dir := filepath.Join(root, ".agents", "skills", "bad\x1b[2J\nFORGED\r\u202e\u2028")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Invalid name fixture\n---\nBody."), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"worker", "planner"} {
+		t.Run(mode, func(t *testing.T) {
+			capture, err := os.CreateTemp(t.TempDir(), "stderr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer capture.Close()
+			stderr := os.Stderr
+			os.Stderr = capture
+			defer func() { os.Stderr = stderr }()
+			model := &inspectSkillModel{inspect: func(_ []llm.Message, _ llm.ChatOptions) (*llm.Response, error) {
+				return &llm.Response{Message: llm.Message{Role: "assistant", Content: `{"goal":"answer","tasks":[{"id":"answer","goal":"answer","role":"ask","deps":[]}]}`}}, nil
+			}}
+			d := testDeps(t, model)
+			if mode == "worker" {
+				_, err = BuildWorker(RoleAsk, d, Options{})
+			} else {
+				_, err = MakePlanWithRequest(context.Background(), d, "answer", skills.Request{Instructions: "answer"})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(capture.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(data)
+			if strings.ContainsAny(text, "\x1b\r\u202e\u2028") || strings.Count(text, "\n") != 1 || !strings.HasPrefix(text, "skills: ") || !strings.Contains(text, `\u001b[2J\u000aFORGED\u000d\u202e\u2028`) {
+				t.Fatalf("unsafe skill diagnostic: %q", text)
+			}
+		})
+	}
+}

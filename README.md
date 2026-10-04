@@ -132,7 +132,13 @@ policy, sandbox recipes).
 in project `.agents/skills/` and `~/.agents/skills/`. The project root is the nearest
 Git worktree root, or cwd outside Git. Project names override personal names with a
 stderr diagnostic; duplicate names within one scope are ambiguous. Symlinked
-bundles work; aliases and directory cycles are deduplicated.
+bundles work; aliases and directory cycles are deduplicated. Each root has a
+separate scan budget of 4,096 directory entries (including regular files) and a
+maximum nesting depth of 32 below the root. A directory exceeding the remaining
+entry budget is skipped as a whole; deeper subtrees are skipped. Reaching a limit
+reports `scan_limit` and an incomplete inventory, retaining discovered entries
+and scanning the other root independently. These bounds limit traversal work,
+not the duration of an individual filesystem operation.
 
 ```markdown
 ---
@@ -216,7 +222,7 @@ entries never receive `✔`. Missing roots and empty inventories are normal.
 
 Skills are sorted by name. Each diagnostic has `category`, `message` and `paths`.
 Categories are `invalid`, `ambiguous`, `overridden`, `filesystem`, `naming`,
-`description_abbreviated`, `unsupported_metadata` and `catalog_limit`. Paths are
+`description_abbreviated`, `unsupported_metadata`, `catalog_limit` and `scan_limit`. Paths are
 absolute when available; an unavailable working directory or home may have no
 resolvable path. `complete` reports whether discovery finished. Exit `0` means a
 complete scan, even with entry diagnostics; `1` means an incomplete scan or output
@@ -225,6 +231,12 @@ entries and diagnostics. Interactive errors leave the session running.
 
 `/skills` is reserved for inventory. Use `/skill:skills` to explicitly invoke a
 skill named `skills`.
+
+Docker skill mounts follow the retained conversation. Starting or continuing a
+session, reset, rewind and turn boundaries reconcile aliases and readonly project
+overlays with the stored source directories. Missing or redirected directories
+are omitted. Workers can add accepted bundles throughout a turn; reconciliation
+waits until all workers finish. Inventory commands do not change these mounts.
 
 Request a skill with `/review`, `/skill:review`, or plain language naming it,
 anywhere in the prompt: `open-agent ask "Explain the changes, then use /review"`.

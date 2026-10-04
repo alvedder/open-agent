@@ -343,6 +343,20 @@ func skillExecutionContext(sources []skillSource) (string, []tools.SkillMount, e
 	return text.String(), mounts, nil
 }
 
+// ReconcileSkillHistory restores only the retained conversation's resource mounts.
+// Call at session boundaries, after all workers have joined, never from a worker.
+// Missing or redirected sources are omitted; their next context reports why.
+func ReconcileSkillHistory(history []llm.Message) error {
+	memory, _ := decodeSkillMemory(WorkflowContext(history))
+	_, mounts, err := skillExecutionContext(memory.Sources)
+	if err != nil {
+		// Fail closed rather than keep mounts from the discarded conversation.
+		_ = tools.ReplaceSkillMounts(nil)
+		return err
+	}
+	return tools.ReplaceSkillMounts(mounts)
+}
+
 func commitSkillMounts(mounts []tools.SkillMount) {
 	for _, mount := range mounts {
 		mount.Commit()

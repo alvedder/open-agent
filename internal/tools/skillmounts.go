@@ -49,6 +49,33 @@ func PrepareSkillMount(base string) (SkillMount, error) {
 	return SkillMount{executionDir: base}, nil
 }
 
+// ReplaceSkillMounts reconciles an owning conversation at a quiescent boundary.
+// All workers must have joined before calling: individual workers only Commit.
+// The sandbox itself and its resource settings are unchanged.
+func ReplaceSkillMounts(mounts []SkillMount) error {
+	if docker, ok := active.(interface{ replaceSkillMounts([]SkillMount) error }); ok {
+		return docker.replaceSkillMounts(mounts)
+	}
+	return nil
+}
+
+func (d DockerSandbox) replaceSkillMounts(mounts []SkillMount) error {
+	if d.mounts == nil {
+		return fmt.Errorf("Docker sandbox skill mounts were not initialized")
+	}
+	bundles := make(map[string]string, len(mounts))
+	for _, mount := range mounts {
+		if mount.mounts != d.mounts {
+			return fmt.Errorf("skill mount belongs to another sandbox")
+		}
+		bundles[mount.source] = mount.executionDir
+	}
+	d.mounts.mu.Lock()
+	defer d.mounts.mu.Unlock()
+	d.mounts.bundles = bundles
+	return nil
+}
+
 // MountSkillBundle registers an already accepted bundle for subsequent shells.
 func MountSkillBundle(base string) (string, error) {
 	mount, err := PrepareSkillMount(base)

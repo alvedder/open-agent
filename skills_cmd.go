@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/imhassla/open-agent/internal/skills"
@@ -103,7 +102,7 @@ func formatSkillInventory(inventory skills.Inventory, verbose bool) string {
 	} else {
 		width := 0
 		for _, entry := range inventory.Skills {
-			if n := utf8.RuneCountInString(inventoryText(entry.Name)); n > width {
+			if n := utf8.RuneCountInString(skills.TerminalText(entry.Name)); n > width {
 				width = n
 			}
 		}
@@ -112,9 +111,9 @@ func formatSkillInventory(inventory skills.Inventory, verbose bool) string {
 			if entry.UserOnly {
 				policy = "locked by author · user-only · "
 			}
-			fmt.Fprintf(&out, "✔ %-*s  %s%s · ~%d tok\n", width, inventoryText(entry.Name), policy, entry.Scope, entry.EstimatedTokens)
+			fmt.Fprintf(&out, "✔ %-*s  %s%s · ~%d tok\n", width, skills.TerminalText(entry.Name), policy, entry.Scope, entry.EstimatedTokens)
 			if verbose {
-				fmt.Fprintf(&out, "    %s\n    %s\n", inventoryText(entry.Description), inventoryText(entry.Source))
+				fmt.Fprintf(&out, "    %s\n    %s\n", skills.TerminalText(entry.Description), skills.TerminalText(entry.Source))
 			}
 		}
 		out.WriteString("\n✔ = available; instructions may not be loaded.\n")
@@ -123,24 +122,10 @@ func formatSkillInventory(inventory skills.Inventory, verbose bool) string {
 	if len(inventory.Diagnostics) > 0 {
 		out.WriteString("\nDiagnostics:\n")
 		for _, diagnostic := range inventory.Diagnostics {
-			fmt.Fprintf(&out, "  [%s] %s\n", diagnostic.Category, inventoryText(diagnostic.Message))
+			fmt.Fprintf(&out, "  [%s] %s\n", diagnostic.Category, skills.TerminalText(diagnostic.Message))
 			for _, path := range diagnostic.Paths {
-				fmt.Fprintf(&out, "    %s\n", inventoryText(path))
+				fmt.Fprintf(&out, "    %s\n", skills.TerminalText(path))
 			}
-		}
-	}
-	return out.String()
-}
-
-// Keep filesystem and metadata text on its own terminal line; JSON retains the
-// original strings. In particular, do not interpret embedded terminal controls.
-func inventoryText(text string) string {
-	var out strings.Builder
-	for _, r := range text {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029' {
-			fmt.Fprintf(&out, "\\u%04x", r)
-		} else {
-			out.WriteRune(r)
 		}
 	}
 	return out.String()

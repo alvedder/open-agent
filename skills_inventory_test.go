@@ -449,3 +449,32 @@ func TestSkillInventoryRetainsPersonalSkillsWhenWorkingDirectoryDisappears(t *te
 		}
 	}
 }
+
+func TestSkillInventoryScanLimitReportsPartialResults(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	inventoryBundle(t, home, "personal", "description: Healthy personal skill")
+	deep := filepath.Join(root, ".agents", "skills")
+	for i := 0; i < 33; i++ {
+		deep = filepath.Join(deep, "nested")
+	}
+	if err := os.MkdirAll(deep, 0755); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code := inventoryCommand(t, root, home, "skills", "list", "--json")
+	var inventory skills.Inventory
+	if err := json.Unmarshal([]byte(out), &inventory); err != nil {
+		t.Fatal(err)
+	}
+	if code != 1 || inventory.Complete || len(inventory.Skills) != 1 || inventory.Skills[0].Name != "personal" {
+		t.Fatalf("exit=%d stderr=%s inventory=%+v", code, stderr, inventory)
+	}
+	found := false
+	for _, d := range inventory.Diagnostics {
+		if d.Category == "scan_limit" && len(d.Paths) > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing limit diagnostic: %+v", inventory.Diagnostics)
+	}
+}

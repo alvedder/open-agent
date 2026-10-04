@@ -111,6 +111,8 @@ func runSession(deps *orchestrator.Deps, opts options, seed string, pin orchestr
 		}
 	}
 
+	s.reconcileSkillMounts()
+
 	// Checkpoints: a shadow-git snapshot store so /rewind can undo the code AND
 	// conversation to before any turn without touching the user's git. Best-effort
 	// — a disabled store just makes /rewind explain why.
@@ -163,9 +165,17 @@ func (s *session) foldHistory(user, assistant string, skillContext ...llm.Messag
 	if historyChars(s.history) > historyBudget {
 		s.compactHistory()
 	}
+	s.reconcileSkillMounts()
 	// Persist after every turn so the dialog survives a restart/update and can be
 	// resumed with --continue. Best-effort: a write failure never breaks the turn.
 	_ = saveSession(s)
+}
+
+// Reconciliation belongs to the session owner, never an ephemeral worker.
+func (s *session) reconcileSkillMounts() {
+	if err := agent.ReconcileSkillHistory(s.history); err != nil {
+		fmt.Fprintf(os.Stderr, "skills: %s\n", skills.TerminalText(err.Error()))
+	}
 }
 
 func historyChars(h []llm.Message) int {
@@ -385,6 +395,9 @@ func (s *session) rewind(arg string) {
 		s.tokens, s.cost = cp.tokens, cp.cost
 		_ = saveSession(s)
 	}
+	if axis == "code" || axis == "chat" || axis == "both" {
+		s.reconcileSkillMounts()
+	}
 	// A FULL rewind discards later turns (they're undone on both axes); a
 	// single-axis rewind leaves the checkpoint list intact so the other axis can
 	// still be rewound to a later turn.
@@ -426,6 +439,7 @@ func (s *session) turn(line string) {
 // converse runs a single conversational turn (ask or code-edit) on an ephemeral
 // worker seeded from the transcript, then folds the exchange back into history.
 func (s *session) converse(ctx context.Context, role orchestrator.Role, line string) {
+	s.reconcileSkillMounts()
 	w, err := orchestrator.BuildWorker(role, s.deps, orchestrator.Options{
 		ModelOverride: s.model, MaxSteps: s.opts.maxSteps, Verbose: s.opts.verbose,
 		Streaming: !s.opts.noStream, StreamOut: os.Stdout, Budget: oneShotBudget(s.opts),
@@ -481,6 +495,7 @@ func (s *session) converse(ctx context.Context, role orchestrator.Role, line str
 // orchestrate runs a multi-step goal as one super-turn: plan → (manual gate) → execute
 // → fold the terminal deliverable back into the conversation as one assistant turn.
 func (s *session) orchestrate(ctx context.Context, line string) {
+	s.reconcileSkillMounts()
 	var references strings.Builder
 	for _, message := range s.history {
 		if message.Name == "skill_context" {
@@ -645,6 +660,7 @@ func (s *session) slash(line string) bool {
 		runSkillInventory(fields[1:], os.Stdout, os.Stderr, false)
 	case "/reset":
 		s.history = nil
+		s.reconcileSkillMounts()
 		_ = saveSession(s)
 		fmt.Println("(conversation history cleared)")
 	case "/rewind":

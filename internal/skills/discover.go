@@ -36,19 +36,30 @@ type Catalog struct {
 // and the user's home. Catalogs belong to a workspace, not a shared model client.
 func Discover(cwd, home string) *Catalog {
 	c := &Catalog{entries: make(map[string][]Metadata)}
-	seen := make(map[string]bool)
-	project := c.projectSkills(cwd, seen)
+	project := c.projectSkills(cwd)
 	personal := make(map[string][]Metadata)
 	if home != "" {
-		personal = c.walk(filepath.Join(home, ".agents", "skills"), "user", seen)
+		personal = c.walk(filepath.Join(home, ".agents", "skills"), "user")
+	}
+	// Each root gets a complete scan budget. Deduplicate only bundles actually
+	// discovered in project scope; a partially visited alias must not hide home.
+	projectBundles := make(map[string]bool)
+	for _, entries := range project {
+		for _, m := range entries {
+			projectBundles[m.BaseDir] = true
+		}
 	}
 	for name, entries := range personal {
-		c.entries[name] = entries
+		for _, m := range entries {
+			if !projectBundles[m.BaseDir] {
+				c.entries[name] = append(c.entries[name], m)
+			}
+		}
 	}
 	for name, entries := range project {
-		if len(personal[name]) > 0 {
-			paths := make([]string, 0, len(entries)+len(personal[name]))
-			for _, m := range append(append([]Metadata{}, entries...), personal[name]...) {
+		if len(c.entries[name]) > 0 {
+			paths := make([]string, 0, len(entries)+len(c.entries[name]))
+			for _, m := range append(append([]Metadata{}, entries...), c.entries[name]...) {
 				paths = append(paths, m.Source)
 			}
 			c.diagnose("overridden", paths, "project skill %q overrides user skill", name)
@@ -70,7 +81,7 @@ func Discover(cwd, home string) *Catalog {
 
 // Resolve and scan project files independently, so a missing or inaccessible
 // working directory cannot hide otherwise readable personal bundles.
-func (c *Catalog) projectSkills(cwd string, seen map[string]bool) map[string][]Metadata {
+func (c *Catalog) projectSkills(cwd string) map[string][]Metadata {
 	root, err := filepath.Abs(cwd)
 	if err != nil {
 		c.diagnose("filesystem", []string{}, "working directory: %v", err)
@@ -93,7 +104,7 @@ func (c *Catalog) projectSkills(cwd string, seen map[string]bool) map[string][]M
 			break
 		}
 	}
-	return c.walk(filepath.Join(root, ".agents", "skills"), "project", seen)
+	return c.walk(filepath.Join(root, ".agents", "skills"), "project")
 }
 
 func (c *Catalog) diagnose(category string, paths []string, format string, args ...any) {
@@ -101,21 +112,29 @@ func (c *Catalog) diagnose(category string, paths []string, format string, args 
 	message := fmt.Sprintf(format, args...)
 	c.diagnostics = append(c.diagnostics, Diagnostic{Category: category, Message: message, Paths: paths})
 	c.Diagnostics = append(c.Diagnostics, strings.Join(paths, ", ")+": "+message)
-	if category == "filesystem" {
+	if category == "filesystem" || category == "scan_limit" {
 		c.incomplete = true
 	}
 }
 
-func (c *Catalog) walk(root, scope string, seen map[string]bool) map[string][]Metadata {
+// These fixed per-root work limits preserve ordinary recursive aliases without
+// allowing a checkout link to walk an entire host filesystem. They bound entries
+// and depth, not wall time for a stalled filesystem operation.
+const maxDiscoveryEntries = 4096
+const maxDiscoveryDepth = 32
+
+func (c *Catalog) walk(root, scope string) map[string][]Metadata {
 	entries := make(map[string][]Metadata)
+	seen := make(map[string]bool)
+	remaining := maxDiscoveryEntries
 	absolute, err := filepath.Abs(root)
 	if err != nil {
 		c.diagnose("filesystem", []string{root}, "%v", err)
 		return entries
 	}
 	root = absolute
-	var visit func(string)
-	visit = func(path string) {
+	var visit func(string, int)
+	visit = func(path string, depth int) {
 		canonical, err := filepath.EvalSymlinks(path)
 		if err != nil {
 			// An absent root is normal. A dangling root symlink or a failure
@@ -127,6 +146,10 @@ func (c *Catalog) walk(root, scope string, seen map[string]bool) map[string][]Me
 			return
 		}
 		if seen[canonical] {
+			return
+		}
+		if depth > maxDiscoveryDepth {
+			c.diagnose("scan_limit", []string{canonical}, "%s skill scan exceeds depth limit %d", scope, maxDiscoveryDepth)
 			return
 		}
 		info, err := os.Stat(canonical)
@@ -160,18 +183,38 @@ func (c *Catalog) walk(root, scope string, seen map[string]bool) map[string][]Me
 		} else if !os.IsNotExist(err) {
 			c.diagnose("filesystem", []string{file}, "%v", err)
 		}
-		children, err := os.ReadDir(canonical)
+		if remaining == 0 {
+			c.diagnose("scan_limit", []string{canonical}, "%s skill scan exhausted %d-entry limit", scope, maxDiscoveryEntries)
+			return
+		}
+		dir, err := os.Open(canonical)
 		if err != nil {
 			c.diagnose("filesystem", []string{path}, "%v", err)
 			return
 		}
+		// Read at most the remaining budget plus one sentinel, never an eager
+		// listing of a potentially enormous external directory. Skip an oversized
+		// directory as a whole rather than select by filesystem enumeration order.
+		children, err := dir.ReadDir(remaining + 1)
+		dir.Close()
+		if len(children) > remaining {
+			remaining = 0
+			c.diagnose("scan_limit", []string{canonical}, "%s skill scan exceeds %d-entry limit", scope, maxDiscoveryEntries)
+			return
+		}
+		remaining -= len(children)
+		if err != nil && err != io.EOF {
+			c.diagnose("filesystem", []string{path}, "%v", err)
+			return
+		}
+		sort.Slice(children, func(i, j int) bool { return children[i].Name() < children[j].Name() })
 		for _, child := range children {
 			if child.IsDir() || child.Type()&os.ModeSymlink != 0 {
-				visit(filepath.Join(canonical, child.Name()))
+				visit(filepath.Join(canonical, child.Name()), depth+1)
 			}
 		}
 	}
-	visit(root)
+	visit(root, 0)
 	return entries
 }
 

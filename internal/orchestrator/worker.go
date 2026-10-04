@@ -215,7 +215,7 @@ func BuildWorker(role Role, d *Deps, o Options) (*agent.Agent, error) {
 		}
 		catalog = skills.Discover(cwd, home)
 		for _, diagnostic := range catalog.Diagnostics {
-			fmt.Fprintf(os.Stderr, "skills: %s\n", diagnostic)
+			fmt.Fprintf(os.Stderr, "skills: %s\n", skills.TerminalText(diagnostic))
 		}
 		page, err := catalog.List("")
 		if err != nil {
