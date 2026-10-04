@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -145,32 +144,15 @@ func view(m Metadata, file string, start, end int) (View, error) {
 	if file == "" {
 		file = "SKILL.md"
 	}
-	if filepath.IsAbs(file) {
-		return View{}, fmt.Errorf("skill resource must be bundle-relative")
-	}
-	path := filepath.Join(m.BaseDir, file)
-	if !inside(m.BaseDir, path) {
-		return View{}, fmt.Errorf("skill resource escapes bundle")
-	}
-	path, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return View{}, err
-	}
-	if !inside(m.BaseDir, path) {
-		return View{}, fmt.Errorf("skill resource symlink escapes bundle")
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return View{}, err
-	}
-	if !info.Mode().IsRegular() {
-		return View{}, fmt.Errorf("skill resource must be a regular file")
-	}
-	f, err := os.Open(path)
+	f, path, err := openBundleFile(m.BaseDir, file)
 	if err != nil {
 		return View{}, err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return View{}, err
+	}
 	// Count and validate with bounded storage before selecting a page. Exact
 	// total_lines and rejection of invalid UTF-8 anywhere still require full I/O.
 	digest := sha256.New()

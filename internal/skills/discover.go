@@ -3,6 +3,7 @@
 package skills
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -135,6 +136,11 @@ func (c *Catalog) diagnose(category string, paths []string, format string, args 
 const maxDiscoveryEntries = 4096
 const maxDiscoveryDepth = 32
 
+// Bound admitted frontmatter before decoding or retaining fields/diagnostics.
+// Together with the per-root entry budget this also bounds retained metadata.
+// Large instruction bodies remain readable through bounded View pages.
+const maxMetadataBytes = 16 * 1024
+
 func (c *Catalog) walk(root, scope string) map[string][]Metadata {
 	entries := make(map[string][]Metadata)
 	seen := make(map[string]bool)
@@ -242,43 +248,40 @@ var conventionalName = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 func (c *Catalog) metadata(file, base, scope string) (Metadata, error) {
 	m := Metadata{Scope: scope, Source: file, BaseDir: base}
-	resolved, err := filepath.EvalSymlinks(file)
-	if err != nil {
-		return m, err
-	}
-	if !inside(base, resolved) {
-		return m, fmt.Errorf("SKILL.md escapes bundle")
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return m, err
-	}
-	if !info.Mode().IsRegular() {
-		return m, fmt.Errorf("SKILL.md must be a regular file")
-	}
-	f, err := os.Open(resolved)
+	f, _, err := openBundleFile(base, "SKILL.md")
 	if err != nil {
 		return m, err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(f, maxMetadataBytes+1))
 	if err != nil {
 		return m, err
 	}
-	text := strings.ReplaceAll(strings.TrimPrefix(string(data), "\ufeff"), "\r\n", "\n")
-	lines := strings.Split(text, "\n")
-	if len(lines) == 0 || lines[0] != "---" {
-		return m, fmt.Errorf("missing YAML frontmatter and description")
+	lines := bytes.SplitAfter(data, []byte("\n"))
+	frontmatter := make([]byte, 0, len(data))
+	consumed, closed := 0, false
+	for i, line := range lines {
+		consumed += len(line)
+		if consumed > maxMetadataBytes {
+			break
+		}
+		text := strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
+		if i == 0 {
+			if strings.TrimPrefix(text, "\ufeff") != "---" {
+				return m, fmt.Errorf("missing YAML frontmatter and description")
+			}
+		} else if text == "---" || text == "..." {
+			closed = true
+			break
+		} else {
+			frontmatter = append(frontmatter, line...)
+		}
 	}
-	end := 1
-	for end < len(lines) && lines[end] != "---" && lines[end] != "..." {
-		end++
-	}
-	if end == len(lines) {
-		return m, fmt.Errorf("unterminated or oversized YAML frontmatter")
+	if !closed {
+		return m, fmt.Errorf("unterminated YAML frontmatter or frontmatter exceeds %d bytes", maxMetadataBytes)
 	}
 	var fields map[string]any
-	if err := yaml.Unmarshal([]byte(strings.Join(lines[1:end], "\n")), &fields); err != nil {
+	if err := yaml.Unmarshal(frontmatter, &fields); err != nil {
 		return m, fmt.Errorf("invalid YAML: %w", err)
 	}
 	if raw, ok := fields["name"]; ok {
@@ -310,12 +313,17 @@ func (c *Catalog) metadata(file, base, scope string) (Metadata, error) {
 			return m, fmt.Errorf("disable-model-invocation must be a boolean")
 		}
 	}
+	var unsupported []string
 	for key := range fields {
 		switch key {
 		case "name", "description", "disable-model-invocation", "license", "compatibility", "metadata", "version", "author", "tags":
 		default:
-			c.diagnose("unsupported_metadata", []string{file}, "unsupported metadata %q is not enforced", key)
+			unsupported = append(unsupported, key)
 		}
+	}
+	if len(unsupported) > 0 {
+		sort.Strings(unsupported)
+		c.diagnose("unsupported_metadata", []string{file}, "unsupported metadata %q is not enforced", strings.Join(unsupported, ", "))
 	}
 	return m, nil
 }

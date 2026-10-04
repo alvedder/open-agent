@@ -220,6 +220,10 @@ entries never receive `✔`. Missing roots and empty inventories are normal.
 }
 ```
 
+Discovery rejects YAML frontmatter larger than 16 KiB before decoding or retaining
+metadata. Accepted descriptions remain complete in verbose and JSON inventory;
+large instruction bodies remain available through bounded reads.
+
 Skills are sorted by name. Each diagnostic has `category`, `message` and `paths`.
 Categories are `invalid`, `ambiguous`, `overridden`, `filesystem`, `naming`,
 `description_abbreviated`, `unsupported_metadata`, `catalog_limit` and `scan_limit`. Paths are
@@ -278,8 +282,9 @@ user-only helpers lazily. The flag is an invocation policy, not a filesystem
 security boundary; existing code tools can still read files.
 
 Follow-ups and `--continue` retain reference bodies and the original instruction
-sequence in the conversation. Compaction can summarize bodies while preserving
-name/source reminders for another `skill_view`. Explanation remains explanation;
+sequence in the conversation. `--continue` trusts the saved transcript; source-path
+validation does not authenticate historical user intent. Compaction can summarize
+bodies while preserving name/source reminders for another `skill_view`. Explanation remains explanation;
 later stop instructions supersede earlier use. `/reset` clears and immediately
 saves history; `/rewind` restores the matching context. Restoring a conversation
 does not refresh loaded bytes; another actual read uses current files. Retained
