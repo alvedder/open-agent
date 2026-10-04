@@ -353,3 +353,51 @@ func TestRetainedSkillResourcesAcrossPlanningAndWorkers(t *testing.T) {
 		})
 	}
 }
+
+func TestInheritedNamedRequestKeepsRecordedSource(t *testing.T) {
+	for _, removed := range []bool{false, true} {
+		t.Run(strconv.FormatBool(removed), func(t *testing.T) {
+			f := newSkillMountFixture(t)
+			personal := f
+			personal.root = f.home
+			personal.add(t, "shared", "shared")
+			catalog := skills.Discover(f.root, f.home)
+			original, err := catalog.Resolve("shared")
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, _, err := agent.PrepareSkillRequest(catalog, skills.Request{Instructions: "Use /shared"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if removed {
+				if err := os.RemoveAll(original.BaseDir); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				f.add(t, "replacement", "shared")
+			}
+			tools.SetSandbox(tools.DockerSandbox{Image: "fixture:local"})
+			worker := &agent.Agent{Registry: agent.NewRegistry()}
+			worker.ConfigureSkills(skills.Discover(f.root, f.home), &request, true)
+			text, err := worker.PrepareInput("Generated resumed task")
+			if err != nil {
+				t.Fatalf("retained request required current name resolution: %v", err)
+			}
+			if !strings.Contains(text, "Use /shared") || !strings.Contains(agent.WorkflowContext(worker.SkillHistory()), original.Source) {
+				t.Fatal("inherited task lost original intent or source")
+			}
+			if strings.Contains(agent.WorkflowContext(worker.SkillHistory()), "replacement") {
+				t.Fatal("inherited task recorded an unread replacement")
+			}
+			mounts := f.overlays(t)
+			want := 2
+			if removed {
+				want = 1
+			}
+			if mounts["/work/.agents/skills/replacement"] || len(mounts) != want {
+				t.Fatalf("inherited task mounted unexpected sources: %v", mounts)
+			}
+		})
+	}
+}

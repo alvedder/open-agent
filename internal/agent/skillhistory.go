@@ -218,7 +218,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			return "", fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
 		reminder, _ := json.Marshal(a.skillMemory)
-		execution, _, err := skillExecutionContext(a.skillMemory.Sources)
+		execution, _, err := skillExecutionContext(catalog, a.skillMemory.Sources)
 		if err != nil || (len(a.skillMemory.Sources) > 0 && len(reminder)+len(execution) > skills.RequiredContextBytes) {
 			a.skillMemory = prior
 			a.skillMu.Unlock()
@@ -227,12 +227,15 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			}
 			return "", fmt.Errorf("required skill execution context exceeds %d bytes", skills.RequiredContextBytes)
 		}
+		retainedSources := len(a.skillMemory.Sources) > 0
 		a.skillMu.Unlock()
 		prepared := skills.Prepared{Request: original}
-		if inherited {
-			prepared.Names, err = catalog.RequestedNames(original.Instructions)
-		} else {
+		if !inherited {
 			prepared, err = catalog.Prepare(original)
+		} else if !retainedSources {
+			// A fresh delegated request needs eligibility, but an owned reminder
+			// already records its sources. Only a new read may resolve them again.
+			prepared.Names, err = catalog.RequestedNames(original.Instructions)
 		}
 		if err != nil {
 			return "", err
@@ -257,7 +260,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			a.skillMu.Unlock()
 			return "", fmt.Errorf("required skill reference and original instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
-		execution, mounts, err := skillExecutionContext(a.skillMemory.Sources)
+		execution, mounts, err := skillExecutionContext(catalog, a.skillMemory.Sources)
 		if err != nil {
 			a.skillMemory = previous
 			a.skillMu.Unlock()
@@ -306,7 +309,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			return fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
 		reminder, _ := json.Marshal(a.skillMemory)
-		execution, mounts, err := skillExecutionContext(a.skillMemory.Sources)
+		execution, mounts, err := skillExecutionContext(catalog, a.skillMemory.Sources)
 		if err != nil {
 			a.skillMemory = previous
 			return err
@@ -330,11 +333,14 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 // Retained bodies own their recorded source directory, even if discovery now
 // resolves the name elsewhere. This preserves identity, not a version snapshot:
 // resources at the same directory may change and are not copied or hashed.
-func skillExecutionContext(sources []skillSource) (string, []tools.SkillMount, error) {
+func skillExecutionContext(catalog *skills.Catalog, sources []skillSource) (string, []tools.SkillMount, error) {
 	var text strings.Builder
 	var mounts []tools.SkillMount
 	for _, source := range sources {
 		canonical, err := filepath.EvalSymlinks(source.BaseDir)
+		if !catalog.HasSource(skills.Metadata{Name: source.Name, Source: source.Source, BaseDir: source.BaseDir}) {
+			err = fmt.Errorf("recorded source is not a valid discovered skill bundle")
+		}
 		if err == nil && (!filepath.IsAbs(source.BaseDir) || canonical != source.BaseDir) {
 			err = fmt.Errorf("recorded bundle directory no longer identifies the same location")
 		}
@@ -361,10 +367,11 @@ func skillExecutionContext(sources []skillSource) (string, []tools.SkillMount, e
 
 // ReconcileSkillHistory restores only the retained conversation's resource mounts.
 // Call at session boundaries, after all workers have joined, never from a worker.
-// Missing or redirected sources are omitted; their next context reports why.
+// Undiscovered, invalid or redirected sources are omitted; their next context reports why.
 func ReconcileSkillHistory(history []llm.Message) error {
 	memory, _ := decodeSkillMemory(WorkflowContext(history))
-	_, mounts, err := skillExecutionContext(memory.Sources)
+	catalog := skills.DiscoverCurrent()
+	_, mounts, err := skillExecutionContext(catalog, memory.Sources)
 	if err != nil {
 		// Fail closed rather than keep mounts from the discarded conversation.
 		_ = tools.ReplaceSkillMounts(nil)
@@ -438,7 +445,7 @@ func PlanSkillRequest(catalog *skills.Catalog, request skills.Request) (Prepared
 	if err != nil {
 		return PreparedSkillRequest{}, err
 	}
-	result, err := prepareSkillPlanningContext(request)
+	result, err := prepareSkillPlanningContext(catalog, request)
 	result.loaded = loaded
 	return result, err
 }
@@ -446,9 +453,9 @@ func PlanSkillRequest(catalog *skills.Catalog, request skills.Request) (Prepared
 // Execution mappings are derived from the completed source reminders, not name
 // resolution. Keep them out of retained bodies so continuation does not accumulate
 // stale mappings. Tool-free replanning can use Context without committing mounts.
-func prepareSkillPlanningContext(request skills.Request) (PreparedSkillRequest, error) {
+func prepareSkillPlanningContext(catalog *skills.Catalog, request skills.Request) (PreparedSkillRequest, error) {
 	memory, _ := decodeSkillMemory(request.WorkflowContext)
-	execution, mounts, err := skillExecutionContext(memory.Sources)
+	execution, mounts, err := skillExecutionContext(catalog, memory.Sources)
 	if err != nil {
 		return PreparedSkillRequest{}, err
 	}
@@ -476,7 +483,7 @@ func PrepareSkillContinuation(catalog *skills.Catalog, request skills.Request) (
 	if err != nil {
 		return PreparedSkillRequest{}, err
 	}
-	prepared, err := prepareSkillPlanningContext(request)
+	prepared, err := prepareSkillPlanningContext(catalog, request)
 	prepared.loaded = loaded
 	return prepared, err
 }

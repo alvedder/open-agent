@@ -238,8 +238,11 @@ skill named `skills`.
 Docker skill mounts follow the retained conversation. Starting or continuing a
 session, reset, rewind and turn boundaries reconcile aliases and readonly project
 overlays with the stored source directories. Missing or redirected directories
-are omitted. Workers can add accepted bundles throughout a turn; reconciliation
-waits until all workers finish. Inventory commands do not change these mounts.
+are omitted. Persisted source paths must match valid bundles discovered from the
+fixed skill roots, including bundles shadowed by name precedence; session data
+alone cannot authorize a host-directory mount. Workers can add accepted bundles
+throughout a turn; reconciliation waits until all workers finish. Inventory
+commands do not change these mounts.
 
 Successful instruction loads appear in the response log beside tool activity:
 
@@ -253,6 +256,9 @@ that the model followed them. Partial instruction reads show `skill read` and
 the line range instead. Retained history, inventory and supporting-file reads
 do not produce a new instruction-load notice; failed loads never report success.
 Explicitly reading the skill again produces another notice.
+
+Autonomous `improve` findings remain generated context. Only the original user
+focus argument can request a user-only skill for its fixing workers.
 
 CLI notices go to stderr, preserving JSON stdout. Saved run events include the
 skill name and source path, and `open-agent replay <run_id>` shows the notices.
@@ -289,9 +295,10 @@ resume; failed tasks remain unfinished. Replanners receive missing instruction
 bodies while preserving complete historical bodies. Interactive `/do` carries
 the continuing context; `do --resume` restores the saved request and references.
 Judges retain their independent criteria; judges, compaction and bulk calls get
-no automatic skill catalog. Code-consensus callers include relevant requirements
-in their existing prompt. Required planning context, including recovery text,
-that cannot fit fails clearly.
+no automatic skill catalog. Plan-consensus tie-breaks reuse validated skill
+references as task requirements, without another invocation. Code-consensus
+callers include relevant requirements in their existing prompt. Required planning
+context, including recovery text, that cannot fit fails clearly.
 
 Scheduled `code`, `ask`, `research` and `do` tasks invoke skills from any position
 in their saved instructions. Upstream chain output travels as generated context

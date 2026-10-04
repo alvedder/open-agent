@@ -57,6 +57,14 @@ func (c *Catalog) Resolve(name string) (Metadata, error) {
 	return entries[0], nil
 }
 
+// HasSource verifies a recorded identity against discovered valid bundles,
+// including ones hidden by precedence or ambiguity. It does not resolve a name
+// to its current winner or trust paths supplied by persisted conversation data.
+func (c *Catalog) HasSource(meta Metadata) bool {
+	known, ok := c.sources[meta.Source]
+	return ok && known.Name == meta.Name && known.BaseDir == meta.BaseDir
+}
+
 // List returns a stable bounded page of automatically selectable metadata.
 func (c *Catalog) List(cursor string) (Page, error) {
 	start := 0

@@ -28,6 +28,7 @@ type Metadata struct {
 type Catalog struct {
 	Diagnostics []string
 	entries     map[string][]Metadata
+	sources     map[string]Metadata // valid discovered identities, including shadowed bundles
 	diagnostics []Diagnostic
 	incomplete  bool
 }
@@ -46,7 +47,7 @@ func DiscoverCurrent() *Catalog {
 // Discover uses the nearest .git directory/file above cwd, or cwd outside Git,
 // and the user's home. Catalogs belong to a workspace, not a shared model client.
 func Discover(cwd, home string) *Catalog {
-	c := &Catalog{entries: make(map[string][]Metadata)}
+	c := &Catalog{entries: make(map[string][]Metadata), sources: make(map[string]Metadata)}
 	project := c.projectSkills(cwd)
 	personal := make(map[string][]Metadata)
 	if home != "" {
@@ -186,6 +187,7 @@ func (c *Catalog) walk(root, scope string) map[string][]Metadata {
 				}
 				c.diagnose(category, []string{file}, "%v", err)
 			} else {
+				c.sources[m.Source] = m
 				entries[m.Name] = append(entries[m.Name], m)
 				if _, fits := catalogMetadata(m); !m.UserOnly && !fits {
 					c.diagnose("catalog_limit", []string{file}, "metadata exceeds catalog page limit; omitted from automatic lists, bounded named reads remain available")
