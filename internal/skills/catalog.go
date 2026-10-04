@@ -1,8 +1,10 @@
 package skills
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -150,27 +152,30 @@ func (c *Catalog) View(name, file string, start, end int) (View, error) {
 	if !info.Mode().IsRegular() {
 		return View{}, fmt.Errorf("skill resource must be a regular file")
 	}
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return View{}, err
 	}
-	if !utf8.Valid(data) {
-		return View{}, fmt.Errorf("skill resource must be UTF-8 text")
+	defer f.Close()
+	// Count and validate with bounded storage before selecting a page. Exact
+	// total_lines and rejection of invalid UTF-8 anywhere still require full I/O.
+	total, err := skillTextLines(f)
+	if err != nil {
+		return View{}, err
 	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return View{}, err
 	}
 	if start <= 0 {
 		start = 1
 	}
-	if end <= 0 || end > len(lines) {
-		end = len(lines)
+	if end <= 0 || end > total {
+		end = total
 	}
-	if end < start && start <= len(lines) {
+	if end < start && start <= total {
 		return View{}, fmt.Errorf("end must not precede start")
 	}
-	v := View{Metadata: m, Path: path, Start: start, End: start - 1, TotalLines: len(lines)}
+	v := View{Metadata: m, Path: path, Start: start, End: start - 1, TotalLines: total}
 	if source, err := filepath.EvalSymlinks(m.Source); err == nil {
 		v.Instructions = path == source
 	}
@@ -184,12 +189,37 @@ func (c *Catalog) View(name, file string, start, end int) (View, error) {
 		return View{}, fmt.Errorf("skill metadata exceeds view page limit")
 	}
 	var out strings.Builder
-	for i := start; i <= end; i++ {
-		line := lines[i-1]
-		if i < len(lines) || strings.HasSuffix(string(data), "\n") {
-			line += "\n"
+	reader := bufio.NewReaderSize(f, 32*1024)
+	for i := 1; i <= end; i++ {
+		// ReadSlice returns bounded fragments even for a huge newline-free
+		// resource. Skipped lines never accumulate; selected lines cannot grow
+		// beyond the output budget before JSON escaping is accounted for.
+		var line []byte
+		read := 0
+		for {
+			fragment, err := reader.ReadSlice('\n')
+			read += len(fragment)
+			if i >= start {
+				if len(line)+len(fragment) > ViewBytes {
+					return View{}, fmt.Errorf("skill resource line %d exceeds %d-byte page limit; split the line to read it", i, ViewBytes)
+				}
+				line = append(line, fragment...)
+			}
+			if err == bufio.ErrBufferFull {
+				continue
+			}
+			if err != nil && err != io.EOF {
+				return View{}, err
+			}
+			if read == 0 {
+				return View{}, fmt.Errorf("skill resource changed while reading; retry")
+			}
+			break
 		}
-		encoded, err := json.Marshal(line)
+		if i < start {
+			continue
+		}
+		encoded, err := json.Marshal(string(line))
 		if err != nil {
 			return View{}, err
 		}
@@ -202,12 +232,46 @@ func (c *Catalog) View(name, file string, start, end int) (View, error) {
 			break
 		}
 		used += size
-		out.WriteString(line)
+		out.Write(line)
 		v.End = i
 	}
-	if v.End < len(lines) && v.NextStart == 0 && v.End >= start {
+	if v.End < total && v.NextStart == 0 && v.End >= start {
 		v.NextStart = v.End + 1
+	}
+	after, err := f.Stat()
+	if err != nil {
+		return View{}, err
+	}
+	if info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
+		return View{}, fmt.Errorf("skill resource changed while reading; retry")
 	}
 	v.Content = out.String()
 	return v, nil
+}
+
+// skillTextLines retains no resource content, including arbitrarily long lines.
+// ReadRune handles UTF-8 characters split across its fixed-size input buffer.
+func skillTextLines(file io.Reader) (int, error) {
+	reader := bufio.NewReaderSize(file, 32*1024)
+	lines := 0
+	unterminated := false
+	for {
+		r, size, err := reader.ReadRune()
+		if err == io.EOF {
+			if unterminated {
+				lines++
+			}
+			return lines, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		if r == utf8.RuneError && size == 1 {
+			return 0, fmt.Errorf("skill resource must be UTF-8 text")
+		}
+		unterminated = r != '\n'
+		if !unterminated {
+			lines++
+		}
+	}
 }

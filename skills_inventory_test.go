@@ -9,12 +9,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-
-	"github.com/imhassla/open-agent/internal/llm"
-	"github.com/imhassla/open-agent/internal/skills"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/imhassla/open-agent/internal/llm"
+	"github.com/imhassla/open-agent/internal/skills"
 )
 
 // Exercise the real main dispatch in a child so exit codes and stdout are part
@@ -22,6 +22,20 @@ import (
 func TestSkillInventoryCommandHelper(t *testing.T) {
 	if os.Getenv("OPEN_AGENT_INVENTORY_HELPER") != "1" {
 		return
+	}
+	if os.Getenv("OPEN_AGENT_INVENTORY_REMOVE_CWD") == "1" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(cwd); err != nil {
+			t.Fatal(err)
+		}
+		// Some systems retain a Getwd path after unlink; others fail Getwd.
+		// In either case project resolution must fail without hiding home skills.
+		if _, err := os.Stat(cwd); !os.IsNotExist(err) {
+			t.Fatal("fixture working directory still exists")
+		}
 	}
 	http.DefaultTransport = inventoryNoNetwork{}
 	for i, arg := range os.Args {
@@ -405,6 +419,33 @@ func TestSkillInventoryFlagsBeforeCommandStayOffline(t *testing.T) {
 		out, stderr, code := inventoryCommand(t, root, home, args...)
 		if code != 2 || out != "" || stderr == "" {
 			t.Errorf("%v: exit %d: %s %s", args, code, out, stderr)
+		}
+	}
+}
+
+func TestSkillInventoryRetainsPersonalSkillsWhenWorkingDirectoryDisappears(t *testing.T) {
+	home := t.TempDir()
+	source := inventoryBundle(t, home, "personal", "description: Personal workflow\ndisable-model-invocation: true")
+	t.Setenv("OPEN_AGENT_INVENTORY_REMOVE_CWD", "1")
+	for _, jsonOut := range []bool{true, false} {
+		args := []string{"skills", "list", "--verbose"}
+		if jsonOut {
+			args = append(args, "--json")
+		}
+		out, stderr, code := inventoryCommand(t, t.TempDir(), home, args...)
+		if code != 1 || stderr != "" {
+			t.Fatalf("exit %d: %s %s", code, out, stderr)
+		}
+		if jsonOut {
+			var got skills.Inventory
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("invalid JSON %q: %v", out, err)
+			}
+			if got.Complete || len(got.Skills) != 1 || got.Skills[0].Source != source || !got.Skills[0].UserOnly || len(got.Diagnostics) == 0 || got.Diagnostics[0].Category != "filesystem" {
+				t.Fatalf("personal skill lost with cwd: %s", out)
+			}
+		} else if !strings.Contains(out, "inventory incomplete") || !strings.Contains(out, "✔ personal") || !strings.Contains(out, source) {
+			t.Fatalf("personal skill lost with cwd: %s", out)
 		}
 	}
 }

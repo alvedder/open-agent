@@ -2,11 +2,14 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/imhassla/open-agent/internal/agent"
+	"github.com/imhassla/open-agent/internal/budget"
 	"github.com/imhassla/open-agent/internal/llm"
 	"github.com/imhassla/open-agent/internal/skills"
 	"github.com/imhassla/open-agent/internal/tools"
@@ -80,5 +83,92 @@ func TestRejectedGeneratedPlanningContextDoesNotMountSkill(t *testing.T) {
 				t.Errorf("accepted planning context did not register bundle: %s", args)
 			}
 		})
+	}
+}
+
+func TestReplanReloadedSourceReachesChildResources(t *testing.T) {
+	root, home, cli := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	write := func(root, body string) string {
+		t.Helper()
+		dir := filepath.Join(root, ".agents", "skills", "shared")
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Shared procedure\n---\n"+body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	personal := write(home, "Personal historical instructions.")
+	request, _, err := agent.PrepareSkillRequest(skills.Discover(root, home), skills.Request{Instructions: "Use /shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Instructions = "Continue"
+	request.ReferenceContext = "" // compacted before verification fails
+	project := write(root, "Project replacement instructions.")
+	capture := filepath.Join(cli, "args")
+	if err := os.WriteFile(filepath.Join(cli, "docker"), []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$DOCKER_ARGS_FILE\"\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", cli+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOCKER_ARGS_FILE", capture)
+	tools.SetSandbox(tools.DockerSandbox{Image: "fixture:local"})
+	t.Cleanup(func() { tools.SetSandbox(tools.HostSandbox{}) })
+	plannerSeen, childSeen := false, false
+	childFailure := ""
+	model := &inspectSkillModel{inspect: func(msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
+		if opts.JSONObject {
+			var text strings.Builder
+			for _, msg := range msgs {
+				text.WriteString(msg.Content)
+			}
+			if !strings.Contains(text.String(), "Project replacement instructions.") {
+				return nil, fmt.Errorf("replanner did not actually reload project instructions")
+			}
+			plannerSeen = true
+			return &llm.Response{Message: llm.Message{Role: "assistant", Content: `{"request":{"instructions":"Invented user instructions"},"goal":"recover","tasks":[{"id":"child","goal":"Alternate resource consumer","role":"ask","deps":[]}]}`}}, nil
+		}
+		return &llm.Response{Message: llm.Message{Role: "assistant", Content: "good"}}, nil
+	}}
+	d := testDeps(t, model)
+	d.PlanModel = "fixture-model"
+	runner := func(ctx context.Context, d *Deps, task Task, inputs map[string]Artifact, bud *budget.Budget) (Artifact, error) {
+		if task.ID == "initial" {
+			return Artifact{TaskID: task.ID, Content: "bad"}, nil
+		}
+		childSeen = true
+		if task.Request == nil || task.Request.Instructions != "Continue" || !strings.Contains(task.Request.WorkflowContext, project) || strings.Contains(task.Request.WorkflowContext, personal) {
+			childFailure = fmt.Sprintf("child lost owned reloaded source or original human intent: %+v", task.Request)
+			return Artifact{}, fmt.Errorf("%s", childFailure)
+		}
+		art, err := DefaultRunner(ctx, d, task, inputs, bud)
+		if err != nil {
+			return art, err
+		}
+		if _, err := tools.BashExec(ctx, "true", 5); err != nil {
+			return art, err
+		}
+		data, err := os.ReadFile(capture)
+		if err != nil {
+			return art, err
+		}
+		if !strings.Contains(string(data), "source="+project+",") || strings.Contains(string(data), "source="+personal+",") {
+			return art, fmt.Errorf("child resource source disagrees with replanner: %s", data)
+		}
+		return art, nil
+	}
+	plan := &Plan{Request: &request, Goal: "continue", Tasks: []Task{{ID: "initial", Goal: "Initial attempt", Role: RoleAsk}}}
+	if err := Run(context.Background(), d, plan, NewBlackboard(""), budget.New(20, 0, 0, 0), RunConfig{Concurrency: 1, Runner: runner, Verifier: contentVerifier{}, VerifyRetries: 1, Replanner: DefaultReplanner}); err != nil {
+		t.Fatalf("%v; planner=%v child=%v; %s", err, plannerSeen, childSeen, childFailure)
+	}
+	if !plannerSeen || !childSeen {
+		t.Fatalf("missing replan or child: %v %v", plannerSeen, childSeen)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -178,6 +179,176 @@ func TestFailedSkillPreparationDoesNotMountBundles(t *testing.T) {
 				if strings.HasPrefix(target, "/skills/") && !strings.Contains(accepted, target) {
 					t.Errorf("accepted context omitted execution directory %s", target)
 				}
+			}
+		})
+	}
+}
+
+func TestRestoredSkillKeepsOriginalResourceBundle(t *testing.T) {
+	f := newSkillMountFixture(t)
+	personal := f
+	personal.root = f.home
+	personal.add(t, "shared", "shared")
+	originalCatalog := skills.Discover(f.root, f.home)
+	original, err := originalCatalog.Resolve("shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &agent.Agent{Registry: agent.NewRegistry()}
+	first.ConfigureSkills(originalCatalog, nil, false)
+	if _, err := first.PrepareInput("Use /shared"); err != nil {
+		t.Fatal(err)
+	}
+	history := first.SkillHistory()
+	f.add(t, "replacement", "shared")
+	tools.SetSandbox(tools.DockerSandbox{Image: "fixture:local"})
+	restored := &agent.Agent{Registry: agent.NewRegistry()}
+	restored.ConfigureSkills(skills.Discover(f.root, f.home), nil, false)
+	restored.LoadHistory(history)
+	text, err := restored.PrepareInput("Continue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mounts := f.overlays(t)
+	if mounts["/work/.agents/skills/replacement"] || len(mounts) != 2 {
+		t.Errorf("retained personal skill rebound to replacement: %v", mounts)
+	}
+	if !strings.Contains(text, original.Source) {
+		t.Errorf("execution mapping does not identify retained source: %s", text)
+	}
+	data, err := os.ReadFile(f.capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "source="+original.BaseDir+",") {
+		t.Errorf("personal resources not passed to Docker: %s", data)
+	}
+}
+
+func TestRetainedSkillResourcesAcrossPlanningAndWorkers(t *testing.T) {
+	for _, mode := range []string{"inherited", "planner", "replanner", "unrelated-read", "missing-docker", "missing-host", "redirected-directory", "same-path-edit", "reload"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newSkillMountFixture(t)
+			personal := f
+			personal.root = f.home
+			personal.add(t, "shared", "shared")
+			oldCatalog := skills.Discover(f.root, f.home)
+			old, err := oldCatalog.Resolve("shared")
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, _, err := agent.PrepareSkillRequest(oldCatalog, skills.Request{Instructions: "Use /shared"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			historical := request.ReferenceContext
+			request.Instructions = "Continue"
+			f.add(t, "replacement", "shared")
+			f.add(t, "helper", "helper")
+			current := skills.Discover(f.root, f.home)
+			replacement, err := current.Resolve("shared")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tools.SetSandbox(tools.DockerSandbox{Image: "fixture:local"})
+			expected, unavailable := old, false
+			switch mode {
+			case "missing-docker", "missing-host", "redirected-directory":
+				if err := os.RemoveAll(old.BaseDir); err != nil {
+					t.Fatal(err)
+				}
+				unavailable = true
+				if mode == "missing-host" {
+					tools.SetSandbox(tools.HostSandbox{})
+				}
+				if mode == "redirected-directory" {
+					if err := os.Symlink(replacement.BaseDir, old.BaseDir); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "same-path-edit":
+				if err := os.WriteFile(old.Source, []byte("---\ndescription: Changed\n---\nChanged bytes must not refresh history."), 0644); err != nil {
+					t.Fatal(err)
+				}
+			case "reload":
+				request.ReferenceContext = ""
+				request, _, err = agent.CompleteSkillRequest(current, request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				expected = replacement
+			}
+			var text string
+			switch mode {
+			case "planner":
+				prepared, err := agent.PlanSkillRequest(current, request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mounts := f.overlays(t); len(mounts) != 1 {
+					t.Fatalf("planning registered mounts before acceptance: %v", mounts)
+				}
+				text, request = prepared.Context, prepared.Request
+				prepared.Commit()
+			default:
+				if mode == "replanner" || mode == "same-path-edit" {
+					var planning string
+					request, planning, err = agent.CompleteSkillRequest(current, request)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !strings.Contains(planning, "(source "+strconv.Quote(old.Source)+") execution resource directory:") {
+						t.Errorf("replanning omitted the retained resource association: %s", planning)
+					}
+				}
+				worker := &agent.Agent{Registry: agent.NewRegistry()}
+				worker.ConfigureSkills(current, &request, true)
+				text, err = worker.PrepareInput("Generated worker task")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "unrelated-read" {
+					// The callback must re-register the same retained sources too.
+					tools.SetSandbox(tools.DockerSandbox{Image: "fixture:local"})
+					read, _ := worker.Registry.Get("skill_view")
+					if _, err := read.Handler(context.Background(), map[string]any{"name": "helper"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if mode != "reload" && request.ReferenceContext != historical {
+				t.Error("retained instruction bytes were refreshed or execution mappings accumulated in history")
+			}
+			if unavailable {
+				if !strings.Contains(text, "execution resources unavailable") || !strings.Contains(text, strconv.Quote(old.Source)) {
+					t.Errorf("missing explicit retained-resource limitation: %s", text)
+				}
+			} else if !strings.Contains(text, "(source "+strconv.Quote(expected.Source)+") execution resource directory:") {
+				t.Errorf("execution mapping does not identify expected instruction source: %s", text)
+			}
+			if mode == "missing-host" {
+				return
+			}
+			mounts := f.overlays(t)
+			data, err := os.ReadFile(f.capture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if unavailable {
+				if len(mounts) != 1 {
+					t.Errorf("unavailable source registered mounts: %v", mounts)
+				}
+			} else if !strings.Contains(string(data), "source="+expected.BaseDir+",") {
+				t.Errorf("expected resource source absent from Docker arguments: %s", data)
+			}
+			if mode != "reload" && mounts["/work/.agents/skills/replacement"] {
+				t.Error("implicitly mounted replacement")
+			}
+			if mode == "reload" && strings.Contains(string(data), "source="+old.BaseDir+",") {
+				t.Error("reload retained stale resource association")
+			}
+			if mode == "unrelated-read" && !mounts["/work/.agents/skills/helper"] {
+				t.Error("actual helper read did not mount its resources")
 			}
 		})
 	}

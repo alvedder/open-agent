@@ -3,6 +3,8 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/imhassla/open-agent/internal/llm"
@@ -215,7 +217,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			return "", fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
 		reminder, _ := json.Marshal(a.skillMemory)
-		execution, _, err := skillExecutionContext(catalog, a.skillMemory.Sources)
+		execution, _, err := skillExecutionContext(a.skillMemory.Sources)
 		if err != nil || (len(a.skillMemory.Sources) > 0 && len(reminder)+len(execution) > skills.RequiredContextBytes) {
 			a.skillMemory = prior
 			a.skillMu.Unlock()
@@ -254,7 +256,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			a.skillMu.Unlock()
 			return "", fmt.Errorf("required skill reference and original instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
-		execution, mounts, err := skillExecutionContext(catalog, a.skillMemory.Sources)
+		execution, mounts, err := skillExecutionContext(a.skillMemory.Sources)
 		if err != nil {
 			a.skillMemory = previous
 			a.skillMu.Unlock()
@@ -289,7 +291,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			return fmt.Errorf("required original skill instruction context exceeds %d bytes", skills.RequiredContextBytes)
 		}
 		reminder, _ := json.Marshal(a.skillMemory)
-		execution, mounts, err := skillExecutionContext(catalog, a.skillMemory.Sources)
+		execution, mounts, err := skillExecutionContext(a.skillMemory.Sources)
 		if err != nil {
 			a.skillMemory = previous
 			return err
@@ -309,20 +311,34 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 	})
 }
 
-func skillExecutionContext(catalog *skills.Catalog, sources []skillSource) (string, []tools.SkillMount, error) {
+// Retained bodies own their recorded source directory, even if discovery now
+// resolves the name elsewhere. This preserves identity, not a version snapshot:
+// resources at the same directory may change and are not copied or hashed.
+func skillExecutionContext(sources []skillSource) (string, []tools.SkillMount, error) {
 	var text strings.Builder
 	var mounts []tools.SkillMount
 	for _, source := range sources {
-		meta, err := catalog.Resolve(source.Name)
+		canonical, err := filepath.EvalSymlinks(source.BaseDir)
+		if err == nil && (!filepath.IsAbs(source.BaseDir) || canonical != source.BaseDir) {
+			err = fmt.Errorf("recorded bundle directory no longer identifies the same location")
+		}
+		if err == nil {
+			var info os.FileInfo
+			info, err = os.Stat(canonical)
+			if err == nil && !info.IsDir() {
+				err = fmt.Errorf("recorded bundle is not a directory")
+			}
+		}
 		if err != nil {
+			fmt.Fprintf(&text, "\nSkill %q (source %q) execution resources unavailable: %v. Historical instructions remain reference context; no replacement bundle is mounted.", source.Name, source.Source, err)
 			continue
 		}
-		mount, err := tools.PrepareSkillMount(meta.BaseDir)
+		mount, err := tools.PrepareSkillMount(canonical)
 		if err != nil {
 			return "", nil, err
 		}
 		mounts = append(mounts, mount)
-		fmt.Fprintf(&text, "\nSkill %q execution resource directory: %s (task working directory unchanged).", source.Name, mount.ExecutionDir())
+		fmt.Fprintf(&text, "\nSkill %q (source %q) execution resource directory: %s (task working directory unchanged).", source.Name, source.Source, mount.ExecutionDir())
 	}
 	return text.String(), mounts, nil
 }
@@ -373,20 +389,21 @@ func PlanSkillRequest(catalog *skills.Catalog, request skills.Request) (Prepared
 	if err != nil {
 		return PreparedSkillRequest{}, err
 	}
-	var mounts []tools.SkillMount
-	for _, name := range prepared.Names {
-		meta, err := catalog.Resolve(name)
-		if err != nil {
-			return PreparedSkillRequest{}, err
-		}
-		mount, err := tools.PrepareSkillMount(meta.BaseDir)
-		if err != nil {
-			return PreparedSkillRequest{}, err
-		}
-		mounts = append(mounts, mount)
-		request.ReferenceContext += fmt.Sprintf("\nSkill %q execution resource directory: %s (task working directory unchanged).", name, mount.ExecutionDir())
+	return prepareSkillPlanningContext(request)
+}
+
+// Execution mappings are derived from the completed source reminders, not name
+// resolution. Keep them out of retained bodies so continuation does not accumulate
+// stale mappings. Tool-free replanning can use Context without committing mounts.
+func prepareSkillPlanningContext(request skills.Request) (PreparedSkillRequest, error) {
+	memory, _ := decodeSkillMemory(request.WorkflowContext)
+	execution, mounts, err := skillExecutionContext(memory.Sources)
+	if err != nil {
+		return PreparedSkillRequest{}, err
 	}
-	context, err := SkillRequestContext(request)
+	withExecution := request
+	withExecution.ReferenceContext += execution
+	context, err := SkillRequestContext(withExecution)
 	if err != nil {
 		return PreparedSkillRequest{}, err
 	}
@@ -400,8 +417,8 @@ func CompleteSkillRequest(catalog *skills.Catalog, request skills.Request) (skil
 	if err != nil {
 		return skills.Request{}, "", err
 	}
-	context, err := SkillRequestContext(request)
-	return request, context, err
+	prepared, err := prepareSkillPlanningContext(request)
+	return request, prepared.Context, err
 }
 
 func completeSkillReferences(catalog *skills.Catalog, request skills.Request) (skills.Request, error) {

@@ -77,6 +77,20 @@ func runTaskWithReplan(ctx context.Context, d *Deps, t Task, inputs map[string]A
 	// saw, so the sub-plan isn't under-specified.
 	enriched := t
 	enriched.Goal = buildTaskPrompt(t, inputs)
+	// Complete owned reminders before the replanner sees them, then carry that
+	// same source identity into its children. Never trust model-generated request
+	// fields, and do not discard provenance from an actual instruction reload.
+	if enriched.Request != nil && enriched.Request.WorkflowContext != "" {
+		catalog, perr := planningCatalog()
+		if perr != nil {
+			return art, errors.Join(err, fmt.Errorf("replanning failed: %w", perr))
+		}
+		request, _, perr := agent.CompleteSkillRequest(catalog, *enriched.Request)
+		if perr != nil {
+			return art, errors.Join(err, fmt.Errorf("replanning failed: %w", perr))
+		}
+		enriched.Request = &request
+	}
 	sub, perr := cfg.Replanner(ctx, d, enriched, err.Error())
 	if perr != nil {
 		return art, errors.Join(err, fmt.Errorf("replanning failed: %w", perr))
@@ -87,7 +101,7 @@ func runTaskWithReplan(ctx context.Context, d *Deps, t Task, inputs map[string]A
 	if verr := sub.Validate(); verr != nil {
 		return art, err // never hand a degenerate plan to the executor
 	}
-	sub.Request = t.Request // sub-plans cannot invent original user instructions
+	sub.Request = enriched.Request // sub-plans cannot invent original user instructions
 
 	// Free our worker slot while the nested run executes, so the replan draws from
 	// the SAME bounded pool instead of adding to it. Re-acquire before returning so

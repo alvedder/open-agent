@@ -322,3 +322,37 @@ func TestOversizedMetadataDoesNotHideHealthySkills(t *testing.T) {
 		t.Error("oversized metadata omission was not diagnosed")
 	}
 }
+
+func TestProjectResolutionFailureRetainsPersonalCatalog(t *testing.T) {
+	home := t.TempDir()
+	bundle(t, home, "personal", "---\ndescription: Personal workflow\n---\nPersonal instructions.\n")
+	bundle(t, home, "private", "---\ndescription: Private workflow\ndisable-model-invocation: true\n---\nPrivate instructions.\n")
+	root := t.TempDir()
+	for _, kind := range []string{"missing", "dangling", "cycle"} {
+		t.Run(kind, func(t *testing.T) {
+			cwd := filepath.Join(root, kind)
+			if kind == "dangling" {
+				if err := os.Symlink(filepath.Join(root, "absent"), cwd); err != nil {
+					t.Fatal(err)
+				}
+			} else if kind == "cycle" {
+				if err := os.Symlink(cwd, cwd); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c := skills.Discover(cwd, home)
+			inventory := c.Inventory()
+			if inventory.Complete || len(inventory.Skills) != 2 || len(inventory.Diagnostics) == 0 || inventory.Diagnostics[0].Category != "filesystem" {
+				t.Fatalf("personal inventory lost: %+v", inventory)
+			}
+			page, err := c.List("")
+			if err != nil || len(page.Skills) != 1 || page.Skills[0].Name != "personal" {
+				t.Fatalf("personal automatic catalog lost: %+v %v", page, err)
+			}
+			prepared, err := c.Prepare(skills.Request{Instructions: "Use /private"})
+			if err != nil || !strings.Contains(prepared.Reference, "Private instructions.") {
+				t.Fatalf("personal named read lost: %+v %v", prepared, err)
+			}
+		})
+	}
+}

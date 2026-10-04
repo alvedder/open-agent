@@ -154,7 +154,8 @@ Workers receive a bounded metadata catalog and use `skills_list(cursor)` and
 Resources are relative to the canonical bundle, with traversal and escaping
 symlinks rejected. Reads run no preprocessing and install no dependencies. Pages
 report `next_cursor` or `next_start`; view ranges are 1-based and inclusive. A
-single line that cannot fit a view page fails clearly and must be split.
+single line that cannot fit a view page fails clearly and must be split. Reads use
+bounded memory; exact line counts and UTF-8 validation still scan the full file.
 
 Inspect what open-agent can discover without asking a model:
 
@@ -242,7 +243,10 @@ sequence in the conversation. Compaction can summarize bodies while preserving
 name/source reminders for another `skill_view`. Explanation remains explanation;
 later stop instructions supersede earlier use. `/reset` clears and immediately
 saves history; `/rewind` restores the matching context. Restoring a conversation
-does not refresh loaded bytes; another actual read uses current files.
+does not refresh loaded bytes; another actual read uses current files. Retained
+instructions keep their recorded resource directory when a same-name override
+appears. Unavailable directories are reported without silently switching bundles;
+files at the same directory are not version snapshots.
 
 `do` planners receive named reference bodies before decomposition and retain the
 original request separately from their generated goals. Workers and spawned

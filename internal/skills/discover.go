@@ -36,30 +36,8 @@ type Catalog struct {
 // and the user's home. Catalogs belong to a workspace, not a shared model client.
 func Discover(cwd, home string) *Catalog {
 	c := &Catalog{entries: make(map[string][]Metadata)}
-	root, err := filepath.Abs(cwd)
-	if err != nil {
-		c.diagnose("filesystem", []string{cwd}, "working directory: %v", err)
-		return c
-	}
-	if resolved, err := filepath.EvalSymlinks(root); err == nil {
-		root = resolved
-	} else {
-		c.diagnose("filesystem", []string{root}, "%v", err)
-		return c
-	}
-	for dir := root; ; dir = filepath.Dir(dir) {
-		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			root = dir
-			break
-		} else if !os.IsNotExist(err) {
-			c.diagnose("filesystem", []string{filepath.Join(dir, ".git")}, "%v", err)
-		}
-		if filepath.Dir(dir) == dir {
-			break
-		}
-	}
 	seen := make(map[string]bool)
-	project := c.walk(filepath.Join(root, ".agents", "skills"), "project", seen)
+	project := c.projectSkills(cwd, seen)
 	personal := make(map[string][]Metadata)
 	if home != "" {
 		personal = c.walk(filepath.Join(home, ".agents", "skills"), "user", seen)
@@ -88,6 +66,34 @@ func Discover(cwd, home string) *Catalog {
 	}
 	sort.Strings(c.Diagnostics)
 	return c
+}
+
+// Resolve and scan project files independently, so a missing or inaccessible
+// working directory cannot hide otherwise readable personal bundles.
+func (c *Catalog) projectSkills(cwd string, seen map[string]bool) map[string][]Metadata {
+	root, err := filepath.Abs(cwd)
+	if err != nil {
+		c.diagnose("filesystem", []string{}, "working directory: %v", err)
+		return nil
+	}
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	} else {
+		c.diagnose("filesystem", []string{root}, "%v", err)
+		return nil
+	}
+	for dir := root; ; dir = filepath.Dir(dir) {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			root = dir
+			break
+		} else if !os.IsNotExist(err) {
+			c.diagnose("filesystem", []string{filepath.Join(dir, ".git")}, "%v", err)
+		}
+		if filepath.Dir(dir) == dir {
+			break
+		}
+	}
+	return c.walk(filepath.Join(root, ".agents", "skills"), "project", seen)
 }
 
 func (c *Catalog) diagnose(category string, paths []string, format string, args ...any) {
