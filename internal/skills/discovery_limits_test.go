@@ -90,3 +90,48 @@ func TestProjectScanLimitDoesNotSuppressAliasedPersonalRoot(t *testing.T) {
 		}
 	}
 }
+
+func TestDiscoveryStopsParsingWhenEntryBudgetIsExhausted(t *testing.T) {
+	for _, shape := range []string{"parent", "earlier-sibling"} {
+		t.Run(shape, func(t *testing.T) {
+			project, home := t.TempDir(), t.TempDir()
+			bundle(t, home, "personal", "---\ndescription: Healthy personal skill\n---\nBody.")
+			root := filepath.Join(project, ".agents", "skills")
+			poison := filepath.Join(root, "z-unvisited")
+			if err := os.MkdirAll(poison, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(poison, "SKILL.md"), []byte("Invalid metadata that must remain unread."), 0644); err != nil {
+				t.Fatal(err)
+			}
+			fill, count := root, 4095 // parent entry enumeration exhausts the budget
+			if shape == "earlier-sibling" {
+				fill, count = filepath.Join(root, "a-prefill"), 4094
+				if err := os.MkdirAll(fill, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for i := 0; i < count; i++ {
+				if err := os.WriteFile(filepath.Join(fill, fmt.Sprintf("asset-%04d", i)), nil, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			inventory := skills.Discover(project, home).Inventory()
+			if inventory.Complete || len(inventory.Skills) != 1 || inventory.Skills[0].Name != "personal" {
+				t.Fatalf("scan limit or independent root lost: %+v", inventory)
+			}
+			limits := 0
+			for _, diagnostic := range inventory.Diagnostics {
+				if diagnostic.Category == "invalid" {
+					t.Errorf("parsed instructions beyond the entry budget: %+v", diagnostic)
+				}
+				if diagnostic.Category == "scan_limit" {
+					limits++
+				}
+			}
+			if limits != 1 {
+				t.Errorf("want one bounded scan-limit diagnostic, got %d", limits)
+			}
+		})
+	}
+}

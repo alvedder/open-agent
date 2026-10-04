@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/imhassla/open-agent/internal/event"
@@ -102,6 +103,7 @@ func (a *Agent) restoreSkillMemory(prior []llm.Message) {
 	defer a.skillMu.Unlock()
 	a.skillMemory = skillMemory{}
 	a.skillTurn = nil
+	a.skillExecution = ""
 	for i := len(prior) - 1; i >= 0; i-- {
 		if prior[i].Name == "skill_reminder" {
 			if memory, ok := decodeSkillMemory(prior[i].Content); ok {
@@ -212,6 +214,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 		}
 		currentInstruction = original.Instructions
 		a.skillTurn = nil
+		a.skillExecution = ""
 		prior := a.skillMemory
 		if !a.skillMemory.rememberInstruction(original.Instructions) {
 			a.skillMu.Unlock()
@@ -272,9 +275,12 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			a.skillMu.Unlock()
 			return "", fmt.Errorf("required skill execution context exceeds %d bytes", skills.RequiredContextBytes)
 		}
-		if context != "" {
-			a.skillTurn = append(a.skillTurn, llm.Message{Role: "user", Name: "skill_context", Content: context})
+		// Persist newly read bodies only. Execution mappings are reconciled for
+		// each turn and must not grow the saved conversation or planning context.
+		if prepared.Reference != "" {
+			a.skillTurn = append(a.skillTurn, llm.Message{Role: "user", Name: "skill_context", Content: prepared.Reference})
 		}
+		a.skillExecution = execution
 		commitSkillMounts(mounts)
 		a.skillMu.Unlock()
 		// Inherited/history context is not a new read. Announce only after the
@@ -319,7 +325,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 			return fmt.Errorf("required skill execution context exceeds %d bytes", skills.RequiredContextBytes)
 		}
 		data, _ := json.Marshal(view)
-		context := "Previously read skill reference context:\n" + string(data)
+		context := skillReadContextPrefix + string(data)
 		if view.Instructions && view.Start == 1 && view.NextStart == 0 {
 			context += skills.CompleteReference(view.Metadata)
 		}
@@ -488,12 +494,52 @@ func PrepareSkillContinuation(catalog *skills.Catalog, request skills.Request) (
 	return prepared, err
 }
 
+const skillReadContextPrefix = "Previously read skill reference context:\n"
+
+// Recompute completeness from retained pages, never from a separate remembered
+// flag: transcript compaction can remove any page. A full-file digest prevents
+// combining pages from different revisions with the same source and line count.
+// Historical pages need no filesystem read and remain ordinary reference context.
+func hasCompleteSkillReference(context string, meta skills.Metadata) bool {
+	if strings.Contains(context, skills.CompleteReference(meta)) {
+		return true
+	}
+	revisions := make(map[string][]skills.View)
+	for _, block := range strings.Split(context, skillReadContextPrefix)[1:] {
+		var page skills.View
+		if err := json.NewDecoder(strings.NewReader(block)).Decode(&page); err != nil {
+			continue
+		}
+		if !page.Instructions || page.Name != meta.Name || page.Source != meta.Source || page.BaseDir != meta.BaseDir || len(page.ContentSHA256) != 64 || page.Start < 1 || page.End < page.Start || page.End > page.TotalLines {
+			continue
+		}
+		key := fmt.Sprintf("%s/%d", page.ContentSHA256, page.TotalLines)
+		revisions[key] = append(revisions[key], page)
+	}
+	for _, pages := range revisions {
+		sort.Slice(pages, func(i, j int) bool { return pages[i].Start < pages[j].Start })
+		end := 0
+		for _, page := range pages {
+			if page.Start > end+1 {
+				break
+			}
+			if page.End > end {
+				end = page.End
+			}
+			if end == page.TotalLines {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func completeSkillReferences(catalog *skills.Catalog, request skills.Request, loaded *[]skills.Metadata) (skills.Request, error) {
 	memory, _ := decodeSkillMemory(request.WorkflowContext)
 	updated := memory
 	updated.Sources = nil
 	for _, source := range memory.Sources {
-		if strings.Contains(request.ReferenceContext, skills.CompleteReference(skills.Metadata{Name: source.Name, Source: source.Source})) {
+		if hasCompleteSkillReference(request.ReferenceContext, skills.Metadata{Name: source.Name, Source: source.Source, BaseDir: source.BaseDir}) {
 			updated.addSource(skills.Metadata{Name: source.Name, Source: source.Source, BaseDir: source.BaseDir})
 			continue
 		}
@@ -501,7 +547,7 @@ func completeSkillReferences(catalog *skills.Catalog, request skills.Request, lo
 		if err != nil {
 			return skills.Request{}, err
 		}
-		if !strings.Contains(request.ReferenceContext, skills.CompleteReference(meta)) {
+		if !hasCompleteSkillReference(request.ReferenceContext, meta) {
 			if meta.UserOnly && !memory.Requested {
 				return skills.Request{}, fmt.Errorf("skill %q is user-only; it requires a named user request or a helper in a requested workflow", source.Name)
 			}

@@ -2,7 +2,10 @@ package agent_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"github.com/imhassla/open-agent/internal/agent"
+	"github.com/imhassla/open-agent/internal/llm"
 	"github.com/imhassla/open-agent/internal/skills"
 	"os"
 	"path/filepath"
@@ -103,5 +106,93 @@ func TestCompleteHistoricalReplacementDoesNotResolveOrGrantNewEligibility(t *tes
 	retained, _, err = agent.CompleteSkillRequest(skills.Discover(project, home), retained)
 	if err != nil || retained.ReferenceContext != loaded.ReferenceContext {
 		t.Fatalf("complete historical body required current source: %v", err)
+	}
+}
+
+func TestPagedSkillHistoryCompletesPlanningWithoutDuplicatingBodies(t *testing.T) {
+	for _, scenario := range []string{"complete", "complete-source-present", "reverse-order", "overlap", "dropped-first-page", "missing-middle", "changed-between-pages", "supporting-file"} {
+		t.Run(scenario, func(t *testing.T) {
+			project, home := t.TempDir(), t.TempDir()
+			dir := filepath.Join(project, ".agents", "skills", "helper")
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			body := "---\ndescription: Paging fixture\n---\n" + strings.Repeat("A retained instruction sentence.\n", 970)
+			file := filepath.Join(dir, "SKILL.md")
+			if err := os.WriteFile(file, []byte(body), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte(body), 0644); err != nil {
+				t.Fatal(err)
+			}
+			catalog := skills.Discover(project, home)
+			worker := &agent.Agent{Registry: agent.NewRegistry()}
+			worker.ConfigureSkills(catalog, nil, false)
+			if _, err := worker.PrepareInput("Investigate evidence"); err != nil {
+				t.Fatal(err)
+			}
+			read, _ := worker.Registry.Get("skill_view")
+			ranges := [][2]int{{1, 500}, {501, 0}}
+			switch scenario {
+			case "reverse-order":
+				ranges = [][2]int{{501, 0}, {1, 500}}
+			case "overlap":
+				ranges = [][2]int{{1, 500}, {490, 0}}
+			case "missing-middle":
+				ranges = [][2]int{{1, 499}, {501, 0}}
+			}
+			for i, bounds := range ranges {
+				if scenario == "changed-between-pages" && i == 1 {
+					// Same length and line count; these pages cannot prove one complete body.
+					if err := os.WriteFile(file, []byte(strings.ReplaceAll(body, "A retained", "B retained")), 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				args := map[string]any{"name": "helper", "start": bounds[0], "end": bounds[1]}
+				if scenario == "supporting-file" {
+					args["file_path"] = "notes.md"
+				}
+				if _, err := read.Handler(context.Background(), args); err != nil {
+					t.Fatal(err)
+				}
+			}
+			history := worker.SkillHistory()
+			if scenario == "dropped-first-page" {
+				history = history[1:]
+			} // transcript compaction may drop any reloadable page
+			data, err := json.Marshal(history)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var restored []llm.Message
+			if err := json.Unmarshal(data, &restored); err != nil {
+				t.Fatal(err)
+			}
+			references := ""
+			for _, m := range restored {
+				if m.Name == "skill_context" {
+					references += m.Content + "\n"
+				}
+			}
+			request := skills.Request{Instructions: "Continue the procedure", WorkflowContext: agent.WorkflowContext(restored), ReferenceContext: references}
+			complete := scenario == "complete" || scenario == "complete-source-present" || scenario == "reverse-order" || scenario == "overlap"
+			if complete && scenario != "complete-source-present" {
+				// Complete retained pages must not touch the source again, even after restart.
+				if err := os.Remove(file); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prepared, err := agent.PlanSkillRequest(skills.Discover(project, home), request)
+			if complete {
+				if err != nil {
+					t.Fatalf("complete retained pages required a reload: %v", err)
+				}
+				if prepared.Request.ReferenceContext != references {
+					t.Fatal("complete retained pages were duplicated or rewritten")
+				}
+			} else if err == nil || !strings.Contains(err.Error(), fmt.Sprint(skills.RequiredContextBytes)) {
+				t.Fatalf("incomplete pages falsely satisfied planning without a bounded reload: %v", err)
+			}
+		})
 	}
 }

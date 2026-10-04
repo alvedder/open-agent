@@ -2,6 +2,7 @@ package skills
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,14 +26,15 @@ type Page struct {
 
 type View struct {
 	Metadata
-	Path         string `json:"path"`
-	Content      string `json:"content"`
-	Start        int    `json:"start"`
-	End          int    `json:"end"`
-	TotalLines   int    `json:"total_lines"`
-	NextStart    int    `json:"next_start,omitempty"`
-	ExecutionDir string `json:"execution_dir,omitempty"` // set by the execution adapter, not discovery
-	Instructions bool   `json:"instructions,omitempty"`  // this file is the bundle's instruction source
+	Path          string `json:"path"`
+	Content       string `json:"content"`
+	ContentSHA256 string `json:"content_sha256,omitempty"` // full-file identity for combining instruction pages
+	Start         int    `json:"start"`
+	End           int    `json:"end"`
+	TotalLines    int    `json:"total_lines"`
+	NextStart     int    `json:"next_start,omitempty"`
+	ExecutionDir  string `json:"execution_dir,omitempty"` // set by the execution adapter, not discovery
+	Instructions  bool   `json:"instructions,omitempty"`  // this file is the bundle's instruction source
 }
 
 func (c *Catalog) names() []string {
@@ -167,7 +169,8 @@ func (c *Catalog) View(name, file string, start, end int) (View, error) {
 	defer f.Close()
 	// Count and validate with bounded storage before selecting a page. Exact
 	// total_lines and rejection of invalid UTF-8 anywhere still require full I/O.
-	total, err := skillTextLines(f)
+	digest := sha256.New()
+	total, err := skillTextLines(io.TeeReader(f, digest))
 	if err != nil {
 		return View{}, err
 	}
@@ -186,6 +189,9 @@ func (c *Catalog) View(name, file string, start, end int) (View, error) {
 	v := View{Metadata: m, Path: path, Start: start, End: start - 1, TotalLines: total}
 	if source, err := filepath.EvalSymlinks(m.Source); err == nil {
 		v.Instructions = path == source
+		if v.Instructions {
+			v.ContentSHA256 = fmt.Sprintf("%x", digest.Sum(nil))
+		}
 	}
 	v.Description = abbreviate(v.Description, 1024)
 	header, err := json.Marshal(v)

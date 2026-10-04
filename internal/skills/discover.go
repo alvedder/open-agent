@@ -139,6 +139,7 @@ func (c *Catalog) walk(root, scope string) map[string][]Metadata {
 	entries := make(map[string][]Metadata)
 	seen := make(map[string]bool)
 	remaining := maxDiscoveryEntries
+	entryLimitReported := false
 	absolute, err := filepath.Abs(root)
 	if err != nil {
 		c.diagnose("filesystem", []string{root}, "%v", err)
@@ -176,30 +177,6 @@ func (c *Catalog) walk(root, scope string) map[string][]Metadata {
 			return
 		}
 		seen[canonical] = true
-		file := filepath.Join(canonical, "SKILL.md")
-		if _, err := os.Lstat(file); err == nil {
-			m, err := c.metadata(file, canonical, scope)
-			if err != nil {
-				category := "invalid"
-				var pathError *os.PathError
-				if errors.As(err, &pathError) {
-					category = "filesystem"
-				}
-				c.diagnose(category, []string{file}, "%v", err)
-			} else {
-				c.sources[m.Source] = m
-				entries[m.Name] = append(entries[m.Name], m)
-				if _, fits := catalogMetadata(m); !m.UserOnly && !fits {
-					c.diagnose("catalog_limit", []string{file}, "metadata exceeds catalog page limit; omitted from automatic lists, bounded named reads remain available")
-				}
-			}
-		} else if !os.IsNotExist(err) {
-			c.diagnose("filesystem", []string{file}, "%v", err)
-		}
-		if remaining == 0 {
-			c.diagnose("scan_limit", []string{canonical}, "%s skill scan exhausted %d-entry limit", scope, maxDiscoveryEntries)
-			return
-		}
 		dir, err := os.Open(canonical)
 		if err != nil {
 			c.diagnose("filesystem", []string{path}, "%v", err)
@@ -212,6 +189,7 @@ func (c *Catalog) walk(root, scope string) map[string][]Metadata {
 		dir.Close()
 		if len(children) > remaining {
 			remaining = 0
+			entryLimitReported = true
 			c.diagnose("scan_limit", []string{canonical}, "%s skill scan exceeds %d-entry limit", scope, maxDiscoveryEntries)
 			return
 		}
@@ -220,9 +198,38 @@ func (c *Catalog) walk(root, scope string) map[string][]Metadata {
 			c.diagnose("filesystem", []string{path}, "%v", err)
 			return
 		}
+		// Metadata reads spend the same entry budget as traversal. A parent
+		// listing must not grant unbudgeted reads in all of its child bundles.
+		for _, child := range children {
+			if child.Name() == "SKILL.md" {
+				file := filepath.Join(canonical, child.Name())
+				m, err := c.metadata(file, canonical, scope)
+				if err != nil {
+					category := "invalid"
+					var pathError *os.PathError
+					if errors.As(err, &pathError) {
+						category = "filesystem"
+					}
+					c.diagnose(category, []string{file}, "%v", err)
+				} else {
+					c.sources[m.Source] = m
+					entries[m.Name] = append(entries[m.Name], m)
+					if _, fits := catalogMetadata(m); !m.UserOnly && !fits {
+						c.diagnose("catalog_limit", []string{file}, "metadata exceeds catalog page limit; omitted from automatic lists, bounded named reads remain available")
+					}
+				}
+			}
+		}
 		sort.Slice(children, func(i, j int) bool { return children[i].Name() < children[j].Name() })
 		for _, child := range children {
 			if child.IsDir() || child.Type()&os.ModeSymlink != 0 {
+				if remaining == 0 {
+					if !entryLimitReported {
+						c.diagnose("scan_limit", []string{canonical}, "%s skill scan exhausted %d-entry limit", scope, maxDiscoveryEntries)
+						entryLimitReported = true
+					}
+					return
+				}
 				visit(filepath.Join(canonical, child.Name()), depth+1)
 			}
 		}

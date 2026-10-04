@@ -699,3 +699,75 @@ func TestFailedSkillExecutionContextDoesNotPoisonContinuation(t *testing.T) {
 		t.Error("failed execution-context preparation blocked short continuation")
 	}
 }
+
+func TestSkillContinuationDoesNotPersistExecutionMappings(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	dir := filepath.Join(root, ".agents", "skills", "workflow")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Fixture\n---\nRetained instructions.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	model := &sessionSkillModel{}
+	deps := &orchestrator.Deps{Client: model, Tlog: telemetry.Open(filepath.Join(home, "t.jsonl"))}
+	s := &session{deps: deps, opts: options{noStream: true}, render: newSessionRenderer(io.Discard)}
+	s.converse(context.Background(), orchestrator.RoleAsk, "Use /workflow")
+	for i := 0; i < 4; i++ {
+		s.converse(context.Background(), orchestrator.RoleAsk, "Continue explaining")
+		state, ok := loadSession()
+		if !ok {
+			t.Fatal("session not saved")
+		}
+		bodies := 0
+		for _, m := range state.History {
+			if m.Name == "skill_context" {
+				bodies++
+			}
+			if strings.Contains(m.Content, "execution resource directory:") {
+				t.Fatal("transient mapping persisted in session history")
+			}
+		}
+		if bodies != 1 {
+			t.Fatalf("continuation added reference bodies: %d", bodies)
+		}
+		live := ""
+		for _, m := range model.seen[len(model.seen)-1] {
+			live += m.Content
+		}
+		if strings.Count(live, "execution resource directory:") != 1 || !strings.Contains(live, "Retained instructions.") {
+			t.Fatal("live request lost instructions or accumulated execution mappings")
+		}
+		s.history = state.History // exercise save/resume on every turn
+	}
+}
+
+func TestReusedWorkerReplacesSkillExecutionMappings(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Chdir(root)
+	t.Setenv("HOME", home)
+	dir := filepath.Join(root, ".agents", "skills", "workflow")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\ndescription: Fixture\n---\nRetained instructions.\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	model := &sessionSkillModel{}
+	worker := &agent.Agent{Client: model, Registry: agent.NewRegistry()}
+	worker.ConfigureSkills(skills.Discover(root, home), nil, false)
+	for _, instruction := range []string{"Use /workflow", "Continue explaining", "Stop using it"} {
+		if _, err := worker.Send(context.Background(), instruction); err != nil {
+			t.Fatal(err)
+		}
+		live := ""
+		for _, m := range model.seen[len(model.seen)-1] {
+			live += m.Content
+		}
+		if strings.Count(live, "execution resource directory:") != 1 || !strings.Contains(live, "Retained instructions.") {
+			t.Fatal("reused worker lost instructions or accumulated execution mappings")
+		}
+	}
+}

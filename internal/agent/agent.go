@@ -61,9 +61,11 @@ type Agent struct {
 	emptyNudges  int        // empty-answer re-prompts issued this Send (bounded to 1)
 	poisonNudges int        // poisoned-tool-call recoveries this Send (bounded to 1)
 	editsApplied int        // successful mutating tool calls this Send (envelope observability)
-	skillMu      sync.Mutex
-	skillMemory  skillMemory   // reference context mirrored from the transcript, never an activation database
-	skillTurn    []llm.Message // named context and reads from the current turn for session folding
+
+	skillMu        sync.Mutex
+	skillMemory    skillMemory   // reference context mirrored from the transcript, never an activation database
+	skillTurn      []llm.Message // named context and reads from the current turn for session folding
+	skillExecution string        // current turn mappings, kept separate from historical bodies
 
 	// StepsTaken counts loop iterations of the LAST Send, surviving a fatal error
 	// (a nil Result) — so telemetry records how far a dead run actually got instead
@@ -135,6 +137,7 @@ func (a *Agent) Reset() {
 	a.skillMu.Lock()
 	a.skillMemory = skillMemory{}
 	a.skillTurn = nil
+	a.skillExecution = ""
 	a.skillMu.Unlock()
 	a.msgs = nil
 	a.ToolErrors = nil
@@ -177,6 +180,17 @@ func (a *Agent) Send(ctx context.Context, userInput string) (*Result, error) {
 		if a.Preamble != "" {
 			a.msgs = append(a.msgs, llm.Message{Role: "user", Content: a.Preamble})
 		}
+	}
+	// Reused workers replace transient mappings instead of retaining stale paths
+	// on every Send. PrepareInput still returns the complete current context.
+	for i := len(a.msgs) - 1; i >= 0; i-- {
+		if a.msgs[i].Name == "skill_execution" {
+			a.msgs = append(a.msgs[:i], a.msgs[i+1:]...)
+		}
+	}
+	inputContext = strings.TrimSuffix(inputContext, a.skillExecution)
+	if a.skillExecution != "" {
+		a.msgs = append(a.msgs, llm.Message{Role: "user", Name: "skill_execution", Content: a.skillExecution})
 	}
 	if inputContext != "" {
 		a.msgs = append(a.msgs, llm.Message{Role: "user", Name: "skill_context", Content: inputContext})
