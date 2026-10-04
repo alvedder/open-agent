@@ -715,20 +715,37 @@ func TestSkillContinuationDoesNotPersistExecutionMappings(t *testing.T) {
 	deps := &orchestrator.Deps{Client: model, Tlog: telemetry.Open(filepath.Join(home, "t.jsonl"))}
 	s := &session{deps: deps, opts: options{noStream: true}, render: newSessionRenderer(io.Discard)}
 	s.converse(context.Background(), orchestrator.RoleAsk, "Use /workflow")
-	for i := 0; i < 4; i++ {
-		s.converse(context.Background(), orchestrator.RoleAsk, "Continue explaining")
+	instructions := []string{"Use /workflow"}
+	for _, instruction := range []string{"Explain step one", "Explain step two", "Stop using the procedure"} {
+		instructions = append(instructions, instruction)
+		s.converse(context.Background(), orchestrator.RoleAsk, instruction)
 		state, ok := loadSession()
 		if !ok {
 			t.Fatal("session not saved")
 		}
-		bodies := 0
+		bodies, reminders := 0, 0
 		for _, m := range state.History {
+			if m.Name == "skill_reminder" {
+				reminders++
+				var reminder struct {
+					Instructions []string `json:"original_user_instructions_in_order"`
+				}
+				if err := json.Unmarshal([]byte(m.Content), &reminder); err != nil {
+					t.Fatal(err)
+				}
+				if strings.Join(reminder.Instructions, "\n") != strings.Join(instructions, "\n") {
+					t.Errorf("saved obsolete instructions: %v", reminder.Instructions)
+				}
+			}
 			if m.Name == "skill_context" {
 				bodies++
 			}
 			if strings.Contains(m.Content, "execution resource directory:") {
 				t.Fatal("transient mapping persisted in session history")
 			}
+		}
+		if reminders != 1 {
+			t.Errorf("saved %d skill reminders; want current state only", reminders)
 		}
 		if bodies != 1 {
 			t.Fatalf("continuation added reference bodies: %d", bodies)
@@ -758,13 +775,30 @@ func TestReusedWorkerReplacesSkillExecutionMappings(t *testing.T) {
 	model := &sessionSkillModel{}
 	worker := &agent.Agent{Client: model, Registry: agent.NewRegistry()}
 	worker.ConfigureSkills(skills.Discover(root, home), nil, false)
-	for _, instruction := range []string{"Use /workflow", "Continue explaining", "Stop using it"} {
+	instructions := []string{"Use /workflow", "Continue explaining", "Stop using it"}
+	for turn, instruction := range instructions {
 		if _, err := worker.Send(context.Background(), instruction); err != nil {
 			t.Fatal(err)
 		}
 		live := ""
+		reminders := 0
 		for _, m := range model.seen[len(model.seen)-1] {
 			live += m.Content
+			if m.Name == "skill_reminder" {
+				reminders++
+				var reminder struct {
+					Instructions []string `json:"original_user_instructions_in_order"`
+				}
+				if err := json.Unmarshal([]byte(m.Content), &reminder); err != nil {
+					t.Fatal(err)
+				}
+				if strings.Join(reminder.Instructions, "\n") != strings.Join(instructions[:turn+1], "\n") {
+					t.Errorf("turn %d exposed obsolete instructions: %v", turn+1, reminder.Instructions)
+				}
+			}
+		}
+		if reminders != 1 {
+			t.Errorf("turn %d exposed %d reminders; want only current state", turn+1, reminders)
 		}
 		if strings.Count(live, "execution resource directory:") != 1 || !strings.Contains(live, "Retained instructions.") {
 			t.Fatal("reused worker lost instructions or accumulated execution mappings")

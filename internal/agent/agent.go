@@ -195,9 +195,9 @@ func (a *Agent) Send(ctx context.Context, userInput string) (*Result, error) {
 	if inputContext != "" {
 		a.msgs = append(a.msgs, llm.Message{Role: "user", Name: "skill_context", Content: inputContext})
 	}
-	if reminder := a.skillReminder(); reminder != "" {
-		a.msgs = append(a.msgs, llm.Message{Role: "user", Name: "skill_reminder", Content: reminder})
-	}
+	// Each reminder already contains the full original-instruction history.
+	// Retain one current copy rather than every obsolete prefix.
+	a.msgs = WithSkillReminder(a.msgs, a.skillReminder())
 	a.msgs = append(a.msgs, llm.Message{Role: "user", Content: userInput})
 
 	// Per-Send apply tracking (RequireApply). Reset each turn so a multi-turn REPL

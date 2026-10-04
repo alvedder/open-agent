@@ -162,6 +162,9 @@ func (s *session) foldHistory(user, assistant string, skillContext ...llm.Messag
 	s.history = append(s.history, llm.Message{Role: "user", Content: user})
 	s.history = append(s.history, skillContext...)
 	s.history = append(s.history, llm.Message{Role: "assistant", Content: assistant})
+	// Replace cumulative reminders before budgeting, so old copies cannot force
+	// early compaction of instruction bodies and conversation turns.
+	s.history = agent.WithSkillReminder(s.history, agent.WorkflowContext(s.history))
 	if historyChars(s.history) > historyBudget {
 		s.compactHistory()
 	}
