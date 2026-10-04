@@ -641,6 +641,8 @@ func (s *session) slash(line string) bool {
 		return true
 	case "/help", "/?":
 		printSessionHelp()
+	case "/skills":
+		runSkillInventory(fields[1:], os.Stdout, os.Stderr, false)
 	case "/reset":
 		s.history = nil
 		_ = saveSession(s)
@@ -724,6 +726,7 @@ func printSessionHelp() {
   /family [name]            show or switch the model family
   /reset                    clear conversation history
   /rewind [n] [code|chat]   undo to before turn n — files + conversation (or one axis); no n lists checkpoints
+  /skills [--verbose]       list current skills and discovery diagnostics (no model call)
   /cost                     session token/cost total
   /help                     this help
   /exit                     quit (Ctrl-D also works)

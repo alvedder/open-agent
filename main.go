@@ -42,6 +42,11 @@ func main() {
 		usage()
 		return
 	}
+	// Inventory is offline and owns its flags, before config or model setup.
+	if len(args) > 0 && args[0] == "skills" {
+		os.Exit(runSkills(args[1:], os.Stdout, os.Stderr))
+	}
+
 	// `sandbox` owns its own flags (--env/--ephemeral/-- CMD) that the strict
 	// top-level parser would reject, so route it on the RAW args first.
 	if len(args) > 0 && args[0] == "sandbox" {
@@ -68,6 +73,21 @@ func main() {
 		cmd = positional[0]
 		positional = positional[1:]
 	}
+	// parseArgs permits flags before the verb. Route this form too, retaining
+	// the original flags so the inventory parser can reject unrelated options.
+	if cmd == "skills" {
+		inventoryArgs := make([]string, 0, len(args)-1)
+		removed := false
+		for _, arg := range args {
+			if !removed && arg == "skills" {
+				removed = true
+				continue
+			}
+			inventoryArgs = append(inventoryArgs, arg)
+		}
+		os.Exit(runSkills(inventoryArgs, os.Stdout, os.Stderr))
+	}
+
 	task := strings.TrimSpace(strings.Join(positional, " "))
 
 	if cmd == "models" {
@@ -669,6 +689,7 @@ Commands:
   research  Read-only web research with grounded, cited search
   ask       Plain chat, no tools
   models    List model families and their per-role models
+  skills    Inspect local skills offline: skills list [--verbose] [--json]
   bench     Execution-grounded self-eval over built-in fixtures (use --families a,b)
   runs      List recorded do-runs (tasks, steps, cost) newest first
   replay    Replay a run's event trace + cache-hit summary: replay <run-id>

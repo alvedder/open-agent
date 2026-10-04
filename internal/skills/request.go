@@ -41,7 +41,7 @@ func CompleteReference(meta Metadata) string {
 // /skill:name form remains available even when the bare command is reserved.
 func IsBuiltin(name string) bool {
 	switch name {
-	case "exit", "quit", "q", "help", "?", "reset", "rewind", "cost", "auto", "manual", "route", "model", "family", "code", "research", "ask", "do", "orchestrate":
+	case "exit", "quit", "q", "help", "?", "skills", "reset", "rewind", "cost", "auto", "manual", "route", "model", "family", "code", "research", "ask", "do", "orchestrate":
 		return true
 	}
 	return false

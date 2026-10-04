@@ -3,6 +3,7 @@
 package skills
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -27,6 +28,8 @@ type Metadata struct {
 type Catalog struct {
 	Diagnostics []string
 	entries     map[string][]Metadata
+	diagnostics []Diagnostic
+	incomplete  bool
 }
 
 // Discover uses the nearest .git directory/file above cwd, or cwd outside Git,
@@ -35,16 +38,21 @@ func Discover(cwd, home string) *Catalog {
 	c := &Catalog{entries: make(map[string][]Metadata)}
 	root, err := filepath.Abs(cwd)
 	if err != nil {
-		c.note("working directory: %v", err)
+		c.diagnose("filesystem", []string{cwd}, "working directory: %v", err)
 		return c
 	}
 	if resolved, err := filepath.EvalSymlinks(root); err == nil {
 		root = resolved
+	} else {
+		c.diagnose("filesystem", []string{root}, "%v", err)
+		return c
 	}
 	for dir := root; ; dir = filepath.Dir(dir) {
 		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 			root = dir
 			break
+		} else if !os.IsNotExist(err) {
+			c.diagnose("filesystem", []string{filepath.Join(dir, ".git")}, "%v", err)
 		}
 		if filepath.Dir(dir) == dir {
 			break
@@ -61,31 +69,54 @@ func Discover(cwd, home string) *Catalog {
 	}
 	for name, entries := range project {
 		if len(personal[name]) > 0 {
-			c.note("project skill %q overrides user skill", name)
+			paths := make([]string, 0, len(entries)+len(personal[name]))
+			for _, m := range append(append([]Metadata{}, entries...), personal[name]...) {
+				paths = append(paths, m.Source)
+			}
+			c.diagnose("overridden", paths, "project skill %q overrides user skill", name)
 		}
 		c.entries[name] = entries
 	}
 	for _, name := range c.names() {
 		if len(c.entries[name]) > 1 {
-			c.note("skill %q is ambiguous in %s scope (%d bundles)", name, c.entries[name][0].Scope, len(c.entries[name]))
+			paths := make([]string, 0, len(c.entries[name]))
+			for _, m := range c.entries[name] {
+				paths = append(paths, m.Source)
+			}
+			c.diagnose("ambiguous", paths, "skill %q is ambiguous in %s scope (%d bundles)", name, c.entries[name][0].Scope, len(c.entries[name]))
 		}
 	}
 	sort.Strings(c.Diagnostics)
 	return c
 }
 
-func (c *Catalog) note(format string, args ...any) {
-	c.Diagnostics = append(c.Diagnostics, fmt.Sprintf(format, args...))
+func (c *Catalog) diagnose(category string, paths []string, format string, args ...any) {
+	sort.Strings(paths)
+	message := fmt.Sprintf(format, args...)
+	c.diagnostics = append(c.diagnostics, Diagnostic{Category: category, Message: message, Paths: paths})
+	c.Diagnostics = append(c.Diagnostics, strings.Join(paths, ", ")+": "+message)
+	if category == "filesystem" {
+		c.incomplete = true
+	}
 }
 
 func (c *Catalog) walk(root, scope string, seen map[string]bool) map[string][]Metadata {
 	entries := make(map[string][]Metadata)
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		c.diagnose("filesystem", []string{root}, "%v", err)
+		return entries
+	}
+	root = absolute
 	var visit func(string)
 	visit = func(path string) {
 		canonical, err := filepath.EvalSymlinks(path)
 		if err != nil {
-			if path != root || !os.IsNotExist(err) {
-				c.note("%s: %v", path, err)
+			// An absent root is normal. A dangling root symlink or a failure
+			// below an existing root prevents a complete inventory.
+			_, statErr := os.Lstat(path)
+			if path != root || !os.IsNotExist(err) || !os.IsNotExist(statErr) {
+				c.diagnose("filesystem", []string{path}, "%v", err)
 			}
 			return
 		}
@@ -94,10 +125,13 @@ func (c *Catalog) walk(root, scope string, seen map[string]bool) map[string][]Me
 		}
 		info, err := os.Stat(canonical)
 		if err != nil {
-			c.note("%s: %v", path, err)
+			c.diagnose("filesystem", []string{path}, "%v", err)
 			return
 		}
 		if !info.IsDir() {
+			if path == root {
+				c.diagnose("filesystem", []string{path}, "skill root must be a directory")
+			}
 			return
 		}
 		seen[canonical] = true
@@ -105,17 +139,24 @@ func (c *Catalog) walk(root, scope string, seen map[string]bool) map[string][]Me
 		if _, err := os.Lstat(file); err == nil {
 			m, err := c.metadata(file, canonical, scope)
 			if err != nil {
-				c.note("%s: %v", file, err)
+				category := "invalid"
+				var pathError *os.PathError
+				if errors.As(err, &pathError) {
+					category = "filesystem"
+				}
+				c.diagnose(category, []string{file}, "%v", err)
 			} else {
 				entries[m.Name] = append(entries[m.Name], m)
 				if _, fits := catalogMetadata(m); !m.UserOnly && !fits {
-					c.note("%s: metadata exceeds catalog page limit; omitted from automatic lists, bounded named reads remain available", file)
+					c.diagnose("catalog_limit", []string{file}, "metadata exceeds catalog page limit; omitted from automatic lists, bounded named reads remain available")
 				}
 			}
+		} else if !os.IsNotExist(err) {
+			c.diagnose("filesystem", []string{file}, "%v", err)
 		}
 		children, err := os.ReadDir(canonical)
 		if err != nil {
-			c.note("%s: %v", path, err)
+			c.diagnose("filesystem", []string{path}, "%v", err)
 			return
 		}
 		for _, child := range children {
@@ -184,14 +225,14 @@ func (c *Catalog) metadata(file, base, scope string) (Metadata, error) {
 		return m, fmt.Errorf("unusable skill name %q", m.Name)
 	}
 	if !conventionalName.MatchString(m.Name) || len(m.Name) > 64 {
-		c.note("%s: name %q does not follow lowercase hyphenated naming (max 64 bytes)", file, m.Name)
+		c.diagnose("naming", []string{file}, "name %q does not follow lowercase hyphenated naming (max 64 bytes)", m.Name)
 	}
 	m.Description, _ = fields["description"].(string)
 	if strings.TrimSpace(m.Description) == "" {
 		return m, fmt.Errorf("description must be a nonempty string")
 	}
 	if len(m.Description) > 1024 {
-		c.note("%s: description exceeds 1024 bytes; catalog display is abbreviated", file)
+		c.diagnose("description_abbreviated", []string{file}, "description exceeds 1024 bytes; automatic catalog display is abbreviated")
 	}
 	if value, ok := fields["disable-model-invocation"]; ok {
 		var valid bool
@@ -204,7 +245,7 @@ func (c *Catalog) metadata(file, base, scope string) (Metadata, error) {
 		switch key {
 		case "name", "description", "disable-model-invocation", "license", "compatibility", "metadata", "version", "author", "tags":
 		default:
-			c.note("%s: unsupported metadata %q is not enforced", file, key)
+			c.diagnose("unsupported_metadata", []string{file}, "unsupported metadata %q is not enforced", key)
 		}
 	}
 	return m, nil

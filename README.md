@@ -156,6 +156,75 @@ symlinks rejected. Reads run no preprocessing and install no dependencies. Pages
 report `next_cursor` or `next_start`; view ranges are 1-based and inclusive. A
 single line that cannot fit a view page fails clearly and must be split.
 
+Inspect what open-agent can discover without asking a model:
+
+```sh
+open-agent skills list
+open-agent skills list --verbose
+open-agent skills list --json
+```
+
+Inside a session, use `/skills` or `/skills --verbose`. Each invocation scans
+current files using the same discovery and precedence rules as workers. Listing
+makes no model calls and does not change conversation history, skill selection
+or sandbox mounts. The standalone command also works offline without an API key.
+
+Example compact output (token estimates are illustrative):
+
+```text
+✔ ask-matt     locked by author · user-only · user · ~30 tok
+✔ code-review  user · ~140 tok
+```
+
+`✔` means valid and unambiguous after precedence; it does not mean instructions
+are already loaded into the conversation. User-only skills and skills too large
+for automatic catalog pages remain visible. `locked by author · user-only`
+reflects `disable-model-invocation: true`, not filesystem permissions. `user` and
+`project` identify scope. Listing has no enable/disable controls.
+
+`~tok` estimates the UTF-8 size of name + a separator + description at roughly
+four bytes per token, rounded up to ten tokens. It describes metadata only, not
+full instructions, billed tokens or actual automatic-context usage. User-only
+skills can have nonzero estimates. `--verbose` adds full descriptions and source
+paths; it never displays the instruction body. Terminal control characters are
+escaped in text output; JSON preserves the original values.
+
+A separate **Diagnostics** section includes reasons and full paths for invalid,
+ambiguous and overridden entries, plus other discovery warnings. Unavailable
+entries never receive `✔`. Missing roots and empty inventories are normal.
+
+`--json` writes exactly one object to stdout, including with `--verbose`:
+
+```json
+{
+  "complete": true,
+  "skills": [
+    {
+      "name": "review",
+      "description": "Review changes.",
+      "user_only": false,
+      "scope": "project",
+      "source": "/workspace/.agents/skills/review/SKILL.md",
+      "base_dir": "/workspace/.agents/skills/review",
+      "estimated_tokens": 10
+    }
+  ],
+  "diagnostics": []
+}
+```
+
+Skills are sorted by name. Each diagnostic has `category`, `message` and `paths`.
+Categories are `invalid`, `ambiguous`, `overridden`, `filesystem`, `naming`,
+`description_abbreviated`, `unsupported_metadata` and `catalog_limit`. Paths are
+absolute when available; an unavailable working directory or home may have no
+resolvable path. `complete` reports whether discovery finished. Exit `0` means a
+complete scan, even with entry diagnostics; `1` means an incomplete scan or output
+failure; `2` means invalid arguments. Incomplete scans retain any discovered
+entries and diagnostics. Interactive errors leave the session running.
+
+`/skills` is reserved for inventory. Use `/skill:skills` to explicitly invoke a
+skill named `skills`.
+
 Request a skill with `/review`, `/skill:review`, or plain language naming it,
 anywhere in the prompt: `open-agent ask "Explain the changes, then use /review"`.
 Leading interactive built-in commands retain their meaning; `/skill:help` names
