@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/imhassla/open-agent/internal/agent"
@@ -33,6 +34,7 @@ type subagentSpawner struct {
 	bud     *budget.Budget
 	request *skills.Request
 	parent  *agent.Agent
+	nextID  atomic.Uint64
 }
 
 func (s *subagentSpawner) Spawn(ctx context.Context, goal, role string) (string, error) {
@@ -58,6 +60,10 @@ func (s *subagentSpawner) Spawn(ctx context.Context, goal, role string) (string,
 	child, err := BuildWorker(r, s.d, Options{Budget: childBud, Request: &request, InheritedRequest: true})
 	if err != nil {
 		return "", err
+	}
+	child.Label = fmt.Sprintf("spawn-%d", s.nextID.Add(1))
+	if s.parent != nil && s.parent.Label != "" {
+		child.Label = s.parent.Label + "/" + child.Label
 	}
 	res, err := child.Run(ctx, goal)
 	if s.parent != nil {

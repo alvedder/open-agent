@@ -241,6 +241,24 @@ overlays with the stored source directories. Missing or redirected directories
 are omitted. Workers can add accepted bundles throughout a turn; reconciliation
 waits until all workers finish. Inventory commands do not change these mounts.
 
+Successful instruction loads appear in the response log beside tool activity:
+
+```text
+  ✓ skill loaded: /ask-matt
+```
+
+This is emitted by open-agent after loading succeeds, before subsequent model
+work. It confirms instructions are available in context; it does not certify
+that the model followed them. Partial instruction reads show `skill read` and
+the line range instead. Retained history, inventory and supporting-file reads
+do not produce a new instruction-load notice; failed loads never report success.
+Explicitly reading the skill again produces another notice.
+
+CLI notices go to stderr, preserving JSON stdout. Saved run events include the
+skill name and source path, and `open-agent replay <run_id>` shows the notices.
+Delegated loads include their task ID. Interactive conversation notices appear
+in the live log; ordinary conversation turns do not create a separate run trace.
+
 Request a skill with `/review`, `/skill:review`, or plain language naming it,
 anywhere in the prompt: `open-agent ask "Explain the changes, then use /review"`.
 Leading interactive built-in commands retain their meaning; `/skill:help` names

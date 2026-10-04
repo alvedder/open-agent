@@ -5,10 +5,11 @@ import (
 	"os"
 
 	"github.com/imhassla/open-agent/internal/agent"
+	"github.com/imhassla/open-agent/internal/event"
 	"github.com/imhassla/open-agent/internal/skills"
 )
 
-func preparePlanningRequest(goal string, request skills.Request) (skills.Request, string, error) {
+func preparePlanningRequest(goal string, request skills.Request, sink event.Emitter) (skills.Request, string, error) {
 	catalog := discoverSkillCatalog()
 	prepared, err := agent.PlanSkillRequest(catalog, request)
 	if err != nil {
@@ -19,6 +20,7 @@ func preparePlanningRequest(goal string, request skills.Request) (skills.Request
 		return skills.Request{}, "", err
 	}
 	prepared.Commit()
+	prepared.EmitLoads(sink, "planner")
 	return prepared.Request, text, nil
 }
 

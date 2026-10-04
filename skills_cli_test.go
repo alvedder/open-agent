@@ -24,6 +24,10 @@ func TestSkillsJSONHelper(t *testing.T) {
 	if os.Getenv("OPEN_AGENT_SKILLS_TEST_HELPER") != "1" {
 		return
 	}
+	if id := os.Getenv("OPEN_AGENT_SKILLS_TEST_REPLAY"); id != "" {
+		replayRun(id)
+		os.Exit(0)
+	}
 	if os.Getenv("OPEN_AGENT_SKILLS_TEST_CRASH") == "1" {
 		os.Exit(42)
 	}
@@ -61,6 +65,11 @@ func TestSkillsJSONHelper(t *testing.T) {
 	}
 	opts := options{jsonOut: true, noStream: true, maxCostUSD: 0.01, maxSteps: 3}
 	if os.Getenv("OPEN_AGENT_SKILLS_TEST_VERB") == "do" {
+		if os.Getenv("OPEN_AGENT_SKILLS_TEST_LOAD_LOG") == "1" {
+			opts.dryRun = true
+			d.Client = &skillLoadPlannerModel{}
+			d.PlanModel = "moonshotai/kimi-k2.6"
+		}
 		runDo(context.Background(), d, os.Getenv("OPEN_AGENT_SKILLS_TEST_PROMPT"), opts)
 	} else {
 		runOneShot(d, orchestrator.RoleAsk, os.Getenv("OPEN_AGENT_SKILLS_TEST_PROMPT"), opts)

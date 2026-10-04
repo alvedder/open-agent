@@ -28,23 +28,22 @@ type Replanner func(ctx context.Context, d *Deps, t Task, failure string) (*Plan
 // the caller re-asserts it on the final result, so both the sub-plan's own gates
 // and the original contract hold.
 func DefaultReplanner(ctx context.Context, d *Deps, t Task, failure string) (*Plan, error) {
-	goal := "A previous attempt to accomplish the following task FAILED verification. " +
-		"Take a genuinely DIFFERENT approach (different decomposition, tools, or strategy).\n\n" +
-		"TASK:\n" + t.Goal +
-		"\n\nWHY THE PREVIOUS ATTEMPT FAILED:\n" + failure
+	goal := replanningGoal(t, failure)
 	request := skills.Request{}
 	if t.Request != nil {
 		request = *t.Request
 	}
 	catalog := discoverSkillCatalog()
-	request, reference, err := agent.CompleteSkillRequest(catalog, request)
+	prepared, err := agent.PrepareSkillContinuation(catalog, request)
 	if err != nil {
 		return nil, err
 	}
-	reference, err = planningRequestText(goal, request, reference)
+	request = prepared.Request
+	reference, err := planningRequestText(goal, request, prepared.Context)
 	if err != nil {
 		return nil, err
 	}
+	prepared.EmitLoads(d.Emit, t.ID)
 	rt, _ := d.route(RolePlan)
 	p, err := makePlanWithRoute(ctx, d.Client, rt, goal, nil, reference)
 	if err != nil {
@@ -52,6 +51,13 @@ func DefaultReplanner(ctx context.Context, d *Deps, t Task, failure string) (*Pl
 	}
 	p.Request = &request
 	return p, nil
+}
+
+func replanningGoal(t Task, failure string) string {
+	return "A previous attempt to accomplish the following task FAILED verification. " +
+		"Take a genuinely DIFFERENT approach (different decomposition, tools, or strategy).\n\n" +
+		"TASK:\n" + t.Goal +
+		"\n\nWHY THE PREVIOUS ATTEMPT FAILED:\n" + failure
 }
 
 // runTaskWithReplan runs a task through the verifier (with Reflexion retries) and,
@@ -77,14 +83,20 @@ func runTaskWithReplan(ctx context.Context, d *Deps, t Task, inputs map[string]A
 	// Complete owned reminders before the replanner sees them, then carry that
 	// same source identity into its children. Never trust model-generated request
 	// fields, and do not discard provenance from an actual instruction reload.
+	var continuation agent.PreparedSkillRequest
 	if enriched.Request != nil && enriched.Request.WorkflowContext != "" {
 		catalog := discoverSkillCatalog()
-		request, _, perr := agent.CompleteSkillRequest(catalog, *enriched.Request)
+		prepared, perr := agent.PrepareSkillContinuation(catalog, *enriched.Request)
 		if perr != nil {
 			return art, errors.Join(err, fmt.Errorf("replanning failed: %w", perr))
 		}
-		enriched.Request = &request
+		if _, perr := planningRequestText(replanningGoal(enriched, err.Error()), prepared.Request, prepared.Context); perr != nil {
+			return art, errors.Join(err, fmt.Errorf("replanning failed: %w", perr))
+		}
+		continuation = prepared
+		enriched.Request = &prepared.Request
 	}
+	continuation.EmitLoads(d.Emit, t.ID)
 	sub, perr := cfg.Replanner(ctx, d, enriched, err.Error())
 	if perr != nil {
 		return art, errors.Join(err, fmt.Errorf("replanning failed: %w", perr))

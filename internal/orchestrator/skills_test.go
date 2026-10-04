@@ -11,6 +11,7 @@ import (
 
 	"github.com/imhassla/open-agent/internal/agent"
 	"github.com/imhassla/open-agent/internal/budget"
+	"github.com/imhassla/open-agent/internal/event"
 	"github.com/imhassla/open-agent/internal/llm"
 	"github.com/imhassla/open-agent/internal/rating"
 	"github.com/imhassla/open-agent/internal/skills"
@@ -304,9 +305,19 @@ func TestSpawnedWorkerInheritsNamedWorkflowAndReturnsSourceContext(t *testing.T)
 		return &llm.Response{Message: llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "read", Type: "function", Function: llm.FunctionCall{Name: "skill_view", Arguments: `{"name":"helper"}`}}}}}, nil
 	}}
 	request := skills.Request{Instructions: "Use /workflow"}
-	art, err := DefaultRunner(context.Background(), testDeps(t, model), Task{ID: "parent", Role: RoleCode, Goal: "Generated parent task", Request: &request}, nil, budget.New(20, 0, 0, 0))
+	deps := testDeps(t, model)
+	var helperLoad event.Event
+	deps.Emit = event.NewBus(func(ev event.Event) {
+		if ev.Kind == "skill_load" && ev.SkillName == "helper" {
+			helperLoad = ev
+		}
+	})
+	art, err := DefaultRunner(context.Background(), deps, Task{ID: "parent", Role: RoleCode, Goal: "Generated parent task", Request: &request}, nil, budget.New(20, 0, 0, 0))
 	if err != nil || art.Content != "Parent evidence verified." {
 		t.Fatalf("spawn result = %+v, %v", art, err)
+	}
+	if helperLoad.TaskID != "parent/spawn-1" {
+		t.Fatalf("spawned skill load has no child identity: %+v", helperLoad)
 	}
 	if !strings.Contains(art.WorkflowContext, "helper") {
 		t.Fatal("spawned source context was discarded")

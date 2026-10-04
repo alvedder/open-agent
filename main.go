@@ -292,7 +292,7 @@ func runOneShot(deps *orchestrator.Deps, role orchestrator.Role, task string, op
 		_ = os.WriteFile(filepath.Join(runDir, "meta.json"), meta, 0o644)
 	}
 	prevEmit := deps.Emit
-	sinks := []func(event.Event){event.StampRunID(runID, event.JSONLSink(filepath.Join(runDir, "events.jsonl")))}
+	sinks := []func(event.Event){event.StampRunID(runID, event.JSONLSink(filepath.Join(runDir, "events.jsonl"))), skillProgress(os.Stderr)}
 	if prevEmit != nil {
 		sinks = append(sinks, prevEmit.Emit)
 	}

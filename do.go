@@ -25,6 +25,12 @@ import (
 type taskEmitter struct{ mu sync.Mutex }
 
 func (e *taskEmitter) Emit(ev event.Event) {
+	if ev.Kind == "skill_load" || ev.Kind == "skill_read" {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		skillProgress(os.Stderr)(ev)
+		return
+	}
 	if ev.Kind != "task" {
 		return
 	}
@@ -75,6 +81,13 @@ func buildOrResumePlanRequest(ctx context.Context, deps *orchestrator.Deps, requ
 	}
 
 	runID, dir = ensureRunDir(newRunID(goal))
+	previousEmitter := deps.Emit
+	sinks := []func(event.Event){event.StampRunID(runID, event.JSONLSink(filepath.Join(dir, "events.jsonl")))}
+	if previousEmitter != nil {
+		sinks = append(sinks, previousEmitter.Emit)
+	}
+	deps.Emit = event.NewBus(sinks...)
+	defer func() { deps.Emit = previousEmitter }()
 	fmt.Fprintln(os.Stderr, "planning…")
 	p, perr := orchestrator.MakePlanConsensusWithRequest(ctx, deps, goal, request, 3, bud)
 	if perr != nil {
@@ -151,6 +164,13 @@ func executePlan(ctx context.Context, deps *orchestrator.Deps, plan *orchestrato
 // subagents (checkpoint/resume + a JSONL event trace), then prints the synthesizer
 // task's answer. Non-interactive (the `do` subcommand) — no plan approval gate.
 func runDo(ctx context.Context, deps *orchestrator.Deps, goal string, opts options) {
+	previousEmitter := deps.Emit
+	sinks := []func(event.Event){skillProgress(os.Stderr)}
+	if previousEmitter != nil {
+		sinks = append(sinks, previousEmitter.Emit)
+	}
+	deps.Emit = event.NewBus(sinks...)
+	defer func() { deps.Emit = previousEmitter }()
 	plan, bb, runID, dir, bud, err := buildOrResumePlan(ctx, deps, goal, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

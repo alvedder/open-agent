@@ -86,7 +86,7 @@ func MakePlan(ctx context.Context, d *Deps, goal string) (*Plan, error) {
 }
 
 func MakePlanWithRequest(ctx context.Context, d *Deps, goal string, request skills.Request) (*Plan, error) {
-	request, reference, err := preparePlanningRequest(goal, request)
+	request, reference, err := preparePlanningRequest(goal, request, d.Emit)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +138,7 @@ func MakePlanConsensus(ctx context.Context, d *Deps, goal string, k int, bud *bu
 }
 
 func MakePlanConsensusWithRequest(ctx context.Context, d *Deps, goal string, request skills.Request, k int, bud *budget.Budget) (*Plan, error) {
-	request, reference, err := preparePlanningRequest(goal, request)
+	request, reference, err := preparePlanningRequest(goal, request, d.Emit)
 	if err != nil {
 		return nil, err
 	}

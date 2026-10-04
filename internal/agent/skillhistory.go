@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/imhassla/open-agent/internal/event"
 	"github.com/imhassla/open-agent/internal/llm"
 	"github.com/imhassla/open-agent/internal/skills"
 	"github.com/imhassla/open-agent/internal/tools"
@@ -273,6 +274,14 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 		}
 		commitSkillMounts(mounts)
 		a.skillMu.Unlock()
+		// Inherited/history context is not a new read. Announce only after the
+		// whole request has passed validation, before the first model call.
+		if !inherited {
+			for _, name := range prepared.Names {
+				meta, _ := catalog.Resolve(name) // already resolved by Prepare
+				a.emitSkillEvent(skillLoadedEvent(meta))
+			}
+		}
 		return context, nil
 	}
 	RegisterSkills(a.Registry, catalog, func() bool {
@@ -281,7 +290,13 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 		return a.skillMemory.Requested
 	}, func(view skills.View) error {
 		a.skillMu.Lock()
-		defer a.skillMu.Unlock()
+		accepted := false
+		defer func() {
+			a.skillMu.Unlock()
+			if accepted && view.Instructions && view.End >= view.Start {
+				a.emitSkillEvent(skillReadEvent(view))
+			}
+		}()
 		// Automatic reads must not persist a reminder that makes the next turn
 		// unusable; reject this read while retaining the prior context unchanged.
 		previous := a.skillMemory
@@ -307,6 +322,7 @@ func (a *Agent) ConfigureSkills(catalog *skills.Catalog, request *skills.Request
 		}
 		a.skillTurn = append(a.skillTurn, llm.Message{Role: "user", Name: "skill_context", Content: context})
 		commitSkillMounts(mounts)
+		accepted = true
 		return nil
 	})
 }
@@ -369,9 +385,23 @@ type PreparedSkillRequest struct {
 	Request skills.Request
 	Context string
 	mounts  []tools.SkillMount
+	loaded  []skills.Metadata
 }
 
 func (p PreparedSkillRequest) Commit() { commitSkillMounts(p.mounts) }
+
+// EmitLoads announces actual reads only after the caller accepts all its context.
+// It does not announce retained instructions or commit shell mounts.
+func (p PreparedSkillRequest) EmitLoads(sink event.Emitter, taskID string) {
+	if sink == nil {
+		return
+	}
+	for _, meta := range p.loaded {
+		ev := skillLoadedEvent(meta)
+		ev.TaskID = taskID
+		sink.Emit(ev)
+	}
+}
 
 // PrepareSkillRequest accepts a request with no additional planning payload.
 func PrepareSkillRequest(catalog *skills.Catalog, request skills.Request) (skills.Request, string, error) {
@@ -399,11 +429,18 @@ func PlanSkillRequest(catalog *skills.Catalog, request skills.Request) (Prepared
 		request.WorkflowContext = string(data)
 	}
 	request.ReferenceContext += prepared.Reference
-	request, err = completeSkillReferences(catalog, request)
+	var loaded []skills.Metadata
+	for _, name := range prepared.Names {
+		meta, _ := catalog.Resolve(name)
+		loaded = append(loaded, meta)
+	}
+	request, err = completeSkillReferences(catalog, request, &loaded)
 	if err != nil {
 		return PreparedSkillRequest{}, err
 	}
-	return prepareSkillPlanningContext(request)
+	result, err := prepareSkillPlanningContext(request)
+	result.loaded = loaded
+	return result, err
 }
 
 // Execution mappings are derived from the completed source reminders, not name
@@ -427,15 +464,24 @@ func prepareSkillPlanningContext(request skills.Request) (PreparedSkillRequest, 
 // CompleteSkillRequest supplies missing instruction bodies for owned source
 // reminders. Complete historical bodies stay unchanged; only absent bodies load.
 func CompleteSkillRequest(catalog *skills.Catalog, request skills.Request) (skills.Request, string, error) {
-	request, err := completeSkillReferences(catalog, request)
-	if err != nil {
-		return skills.Request{}, "", err
-	}
-	prepared, err := prepareSkillPlanningContext(request)
-	return request, prepared.Context, err
+	prepared, err := PrepareSkillContinuation(catalog, request)
+	return prepared.Request, prepared.Context, err
 }
 
-func completeSkillReferences(catalog *skills.Catalog, request skills.Request) (skills.Request, error) {
+// PrepareSkillContinuation completes missing bodies while retaining read receipts
+// until the caller accepts its outer payload. Existing bodies are not reread.
+func PrepareSkillContinuation(catalog *skills.Catalog, request skills.Request) (PreparedSkillRequest, error) {
+	var loaded []skills.Metadata
+	request, err := completeSkillReferences(catalog, request, &loaded)
+	if err != nil {
+		return PreparedSkillRequest{}, err
+	}
+	prepared, err := prepareSkillPlanningContext(request)
+	prepared.loaded = loaded
+	return prepared, err
+}
+
+func completeSkillReferences(catalog *skills.Catalog, request skills.Request, loaded *[]skills.Metadata) (skills.Request, error) {
 	memory, _ := decodeSkillMemory(request.WorkflowContext)
 	updated := memory
 	updated.Sources = nil
@@ -457,6 +503,7 @@ func completeSkillReferences(catalog *skills.Catalog, request skills.Request) (s
 				return skills.Request{}, err
 			}
 			request.ReferenceContext += prior.Reference
+			*loaded = append(*loaded, meta)
 		}
 		// A missing body loads the current name resolution. Remember that actual
 		// source so later completion retains its historical bytes without rereading.

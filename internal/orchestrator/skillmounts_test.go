@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/imhassla/open-agent/internal/agent"
 	"github.com/imhassla/open-agent/internal/budget"
+	"github.com/imhassla/open-agent/internal/event"
 	"github.com/imhassla/open-agent/internal/llm"
 	"github.com/imhassla/open-agent/internal/skills"
 	"github.com/imhassla/open-agent/internal/tools"
@@ -121,6 +123,7 @@ func TestReplanReloadedSourceReachesChildResources(t *testing.T) {
 	t.Setenv("DOCKER_ARGS_FILE", capture)
 	tools.SetSandbox(tools.DockerSandbox{Image: "fixture:local"})
 	t.Cleanup(func() { tools.SetSandbox(tools.HostSandbox{}) })
+	var loadObserved, plannerSawLoad atomic.Bool
 	plannerSeen, childSeen := false, false
 	childFailure := ""
 	model := &inspectSkillModel{inspect: func(msgs []llm.Message, opts llm.ChatOptions) (*llm.Response, error) {
@@ -132,6 +135,7 @@ func TestReplanReloadedSourceReachesChildResources(t *testing.T) {
 			if !strings.Contains(text.String(), "Project replacement instructions.") {
 				return nil, fmt.Errorf("replanner did not actually reload project instructions")
 			}
+			plannerSawLoad.Store(loadObserved.Load())
 			plannerSeen = true
 			return &llm.Response{Message: llm.Message{Role: "assistant", Content: `{"request":{"instructions":"Invented user instructions"},"goal":"recover","tasks":[{"id":"child","goal":"Alternate resource consumer","role":"ask","deps":[]}]}`}}, nil
 		}
@@ -139,6 +143,11 @@ func TestReplanReloadedSourceReachesChildResources(t *testing.T) {
 	}}
 	d := testDeps(t, model)
 	d.PlanModel = "fixture-model"
+	d.Emit = event.NewBus(func(ev event.Event) {
+		if ev.Kind == "skill_load" && ev.SkillName == "shared" {
+			loadObserved.Store(true)
+		}
+	})
 	runner := func(ctx context.Context, d *Deps, task Task, inputs map[string]Artifact, bud *budget.Budget) (Artifact, error) {
 		if task.ID == "initial" {
 			return Artifact{TaskID: task.ID, Content: "bad"}, nil
@@ -167,6 +176,9 @@ func TestReplanReloadedSourceReachesChildResources(t *testing.T) {
 	plan := &Plan{Request: &request, Goal: "continue", Tasks: []Task{{ID: "initial", Goal: "Initial attempt", Role: RoleAsk}}}
 	if err := Run(context.Background(), d, plan, NewBlackboard(""), budget.New(20, 0, 0, 0), RunConfig{Concurrency: 1, Runner: runner, Verifier: contentVerifier{}, VerifyRetries: 1, Replanner: DefaultReplanner}); err != nil {
 		t.Fatalf("%v; planner=%v child=%v; %s", err, plannerSeen, childSeen, childFailure)
+	}
+	if !plannerSawLoad.Load() {
+		t.Fatal("replanner received freshly loaded instructions before the load event")
 	}
 	if !plannerSeen || !childSeen {
 		t.Fatalf("missing replan or child: %v %v", plannerSeen, childSeen)
