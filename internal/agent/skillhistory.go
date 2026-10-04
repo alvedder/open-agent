@@ -543,23 +543,12 @@ func completeSkillReferences(catalog *skills.Catalog, request skills.Request, lo
 			updated.addSource(skills.Metadata{Name: source.Name, Source: source.Source, BaseDir: source.BaseDir})
 			continue
 		}
-		meta, err := catalog.Resolve(source.Name)
+		meta, reference, err := catalog.PrepareSource(skills.Metadata{Name: source.Name, Source: source.Source, BaseDir: source.BaseDir}, memory.Requested)
 		if err != nil {
 			return skills.Request{}, err
 		}
-		if !hasCompleteSkillReference(request.ReferenceContext, meta) {
-			if meta.UserOnly && !memory.Requested {
-				return skills.Request{}, fmt.Errorf("skill %q is user-only; it requires a named user request or a helper in a requested workflow", source.Name)
-			}
-			prior, err := catalog.Prepare(skills.Request{Instructions: "/skill:" + source.Name})
-			if err != nil {
-				return skills.Request{}, err
-			}
-			request.ReferenceContext += prior.Reference
-			*loaded = append(*loaded, meta)
-		}
-		// A missing body loads the current name resolution. Remember that actual
-		// source so later completion retains its historical bytes without rereading.
+		request.ReferenceContext += reference
+		*loaded = append(*loaded, meta)
 		updated.addSource(meta)
 	}
 	if len(updated.Sources) > 0 {

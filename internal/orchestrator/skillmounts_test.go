@@ -132,8 +132,8 @@ func TestReplanReloadedSourceReachesChildResources(t *testing.T) {
 			for _, msg := range msgs {
 				text.WriteString(msg.Content)
 			}
-			if !strings.Contains(text.String(), "Project replacement instructions.") {
-				return nil, fmt.Errorf("replanner did not actually reload project instructions")
+			if !strings.Contains(text.String(), "Personal historical instructions.") || strings.Contains(text.String(), "Project replacement instructions.") {
+				return nil, fmt.Errorf("replanner did not reload the recorded personal instructions")
 			}
 			plannerSawLoad.Store(loadObserved.Load())
 			plannerSeen = true
@@ -144,7 +144,7 @@ func TestReplanReloadedSourceReachesChildResources(t *testing.T) {
 	d := testDeps(t, model)
 	d.PlanModel = "fixture-model"
 	d.Emit = event.NewBus(func(ev event.Event) {
-		if ev.Kind == "skill_load" && ev.SkillName == "shared" {
+		if ev.Kind == "skill_load" && ev.SkillName == "shared" && ev.SkillSource == filepath.Join(personal, "SKILL.md") {
 			loadObserved.Store(true)
 		}
 	})
@@ -153,7 +153,7 @@ func TestReplanReloadedSourceReachesChildResources(t *testing.T) {
 			return Artifact{TaskID: task.ID, Content: "bad"}, nil
 		}
 		childSeen = true
-		if task.Request == nil || task.Request.Instructions != "Continue" || !strings.Contains(task.Request.WorkflowContext, project) || strings.Contains(task.Request.WorkflowContext, personal) {
+		if task.Request == nil || task.Request.Instructions != "Continue" || !strings.Contains(task.Request.WorkflowContext, personal) || strings.Contains(task.Request.WorkflowContext, project) {
 			childFailure = fmt.Sprintf("child lost owned reloaded source or original human intent: %+v", task.Request)
 			return Artifact{}, fmt.Errorf("%s", childFailure)
 		}
@@ -168,7 +168,7 @@ func TestReplanReloadedSourceReachesChildResources(t *testing.T) {
 		if err != nil {
 			return art, err
 		}
-		if !strings.Contains(string(data), "source="+project+",") || strings.Contains(string(data), "source="+personal+",") {
+		if !strings.Contains(string(data), "source="+personal+",") || strings.Contains(string(data), "source="+project+",") {
 			return art, fmt.Errorf("child resource source disagrees with replanner: %s", data)
 		}
 		return art, nil

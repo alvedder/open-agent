@@ -138,6 +138,10 @@ func (c *Catalog) View(name, file string, start, end int) (View, error) {
 	if err != nil {
 		return View{}, err
 	}
+	return view(m, file, start, end)
+}
+
+func view(m Metadata, file string, start, end int) (View, error) {
 	if file == "" {
 		file = "SKILL.md"
 	}
@@ -148,7 +152,7 @@ func (c *Catalog) View(name, file string, start, end int) (View, error) {
 	if !inside(m.BaseDir, path) {
 		return View{}, fmt.Errorf("skill resource escapes bundle")
 	}
-	path, err = filepath.EvalSymlinks(path)
+	path, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return View{}, err
 	}

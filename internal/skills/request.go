@@ -141,26 +141,50 @@ func (c *Catalog) RequestedNames(instructions string) ([]string, error) {
 
 func (c *Catalog) Prepare(request Request) (Prepared, error) {
 	p := Prepared{Request: request}
-	seen := make(map[string]bool)
+	names, err := c.RequestedNames(request.Instructions)
+	if err != nil {
+		return Prepared{}, err
+	}
+	var sources []Metadata
+	for _, name := range names {
+		meta, _ := c.Resolve(name) // already validated by RequestedNames
+		sources = append(sources, meta)
+	}
+	p.Reference, err = prepareReferences(sources)
+	if err != nil {
+		return Prepared{}, err
+	}
+	p.Names = names
+	return p, nil
+}
+
+// PrepareSource reloads a recorded identity, including a shadowed bundle, without
+// resolving its name to a replacement. Current discovered metadata governs access;
+// caller-supplied paths and user-only flags never authorize a read.
+func (c *Catalog) PrepareSource(identity Metadata, requested bool) (Metadata, string, error) {
+	if !c.HasSource(identity) {
+		return Metadata{}, "", fmt.Errorf("skill %q recorded source %q is unavailable (not a valid discovered bundle)", identity.Name, identity.Source)
+	}
+	meta := c.sources[identity.Source]
+	if meta.UserOnly && !requested {
+		return Metadata{}, "", fmt.Errorf("skill %q is user-only; it requires a named user request or a helper in a requested workflow", meta.Name)
+	}
+	reference, err := prepareReferences([]Metadata{meta})
+	return meta, reference, err
+}
+
+func prepareReferences(sources []Metadata) (string, error) {
 	var blocks strings.Builder
-	for _, ref := range c.references(request.Instructions) {
-		if seen[ref.name] {
-			continue
-		}
-		seen[ref.name] = true
-		m, err := c.Resolve(ref.name)
-		if err != nil {
-			return Prepared{}, err
-		}
+	for _, m := range sources {
 		fmt.Fprintf(&blocks, "\nSkill %q — reference context. Source: %s. Resource base_dir: %s.\n", m.Name, m.Source, m.BaseDir)
 		for start := 1; ; {
-			v, err := c.View(m.Name, "", start, 0)
+			v, err := view(m, "", start, 0)
 			if err != nil {
-				return Prepared{}, err
+				return "", err
 			}
 			blocks.WriteString(v.Content)
 			if blocks.Len() > RequiredContextBytes {
-				return Prepared{}, fmt.Errorf("required named skill context exceeds %d bytes; reduce the requested context", RequiredContextBytes)
+				return "", fmt.Errorf("required named skill context exceeds %d bytes; reduce the requested context", RequiredContextBytes)
 			}
 			if v.NextStart == 0 {
 				break
@@ -168,15 +192,15 @@ func (c *Catalog) Prepare(request Request) (Prepared, error) {
 			start = v.NextStart
 		}
 		blocks.WriteString(CompleteReference(m))
-		p.Names = append(p.Names, m.Name)
 	}
-	if len(p.Names) > 0 {
-		p.Reference = "Named skill reference context: interpret it using the complete original user instruction. " +
-			"Explaining or negating a skill does not request its procedure. Later stop instructions supersede earlier use. " +
-			"Only a requested workflow may load named user-only helpers; unrelated generated context creates no request.\n" + blocks.String()
-		if len(p.Reference) > RequiredContextBytes {
-			return Prepared{}, fmt.Errorf("required named skill context exceeds %d bytes; reduce the requested context", RequiredContextBytes)
-		}
+	if len(sources) == 0 {
+		return "", nil
 	}
-	return p, nil
+	reference := "Named skill reference context: interpret it using the complete original user instruction. " +
+		"Explaining or negating a skill does not request its procedure. Later stop instructions supersede earlier use. " +
+		"Only a requested workflow may load named user-only helpers; unrelated generated context creates no request.\n" + blocks.String()
+	if len(reference) > RequiredContextBytes {
+		return "", fmt.Errorf("required named skill context exceeds %d bytes; reduce the requested context", RequiredContextBytes)
+	}
+	return reference, nil
 }

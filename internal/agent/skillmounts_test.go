@@ -276,7 +276,6 @@ func TestRetainedSkillResourcesAcrossPlanningAndWorkers(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				expected = replacement
 			}
 			var text string
 			switch mode {
@@ -341,12 +340,10 @@ func TestRetainedSkillResourcesAcrossPlanningAndWorkers(t *testing.T) {
 			} else if !strings.Contains(string(data), "source="+expected.BaseDir+",") {
 				t.Errorf("expected resource source absent from Docker arguments: %s", data)
 			}
-			if mode != "reload" && mounts["/work/.agents/skills/replacement"] {
+			if mounts["/work/.agents/skills/replacement"] {
 				t.Error("implicitly mounted replacement")
 			}
-			if mode == "reload" && strings.Contains(string(data), "source="+old.BaseDir+",") {
-				t.Error("reload retained stale resource association")
-			}
+
 			if mode == "unrelated-read" && !mounts["/work/.agents/skills/helper"] {
 				t.Error("actual helper read did not mount its resources")
 			}

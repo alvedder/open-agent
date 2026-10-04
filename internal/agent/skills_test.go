@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/imhassla/open-agent/internal/agent"
+	"github.com/imhassla/open-agent/internal/event"
 	"github.com/imhassla/open-agent/internal/llm"
 	"github.com/imhassla/open-agent/internal/skills"
 	"os"
@@ -13,7 +14,7 @@ import (
 	"testing"
 )
 
-func TestCompletedReplacementBodyIsNotReloaded(t *testing.T) {
+func TestCompactedSkillReloadKeepsRecordedSource(t *testing.T) {
 	project, home := t.TempDir(), t.TempDir()
 	write := func(root, body string) {
 		t.Helper()
@@ -25,28 +26,106 @@ func TestCompletedReplacementBodyIsNotReloaded(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(home, "Original personal helper.")
-	original, _, err := agent.PrepareSkillRequest(skills.Discover(project, home), skills.Request{Instructions: "Use /helper"})
+	write(home, strings.Repeat("Original personal helper.\n", 1100))
+	first := skills.Discover(project, home)
+	source, err := first.Resolve("helper")
 	if err != nil {
 		t.Fatal(err)
 	}
+	original, _, err := agent.PrepareSkillRequest(first, skills.Request{Instructions: "Use /helper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historical := original.ReferenceContext
+	original.Instructions = "Continue"
 	original.ReferenceContext = "" // reloadable bodies removed by transcript compaction
-	write(project, strings.Repeat("Project helper procedure.\n", 1100))
+	write(project, "Replacement must not be loaded.")
 	current := skills.Discover(project, home)
 	once, _, err := agent.CompleteSkillRequest(current, original)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if once.ReferenceContext != historical || once.WorkflowContext != original.WorkflowContext {
+		t.Fatal("compacted instructions reloaded a different source")
+	}
 	twice, _, err := agent.CompleteSkillRequest(current, once)
 	if err != nil {
-		t.Errorf("repeated completion reloaded already-complete replacement: %v", err)
+		t.Errorf("repeated completion reloaded already-complete instructions: %v", err)
 	}
 	if err == nil && once.ReferenceContext != twice.ReferenceContext {
 		t.Errorf("completion duplicated complete body: %d -> %d", len(once.ReferenceContext), len(twice.ReferenceContext))
 	}
+	planned, err := agent.PlanSkillRequest(current, original)
+	if err != nil || planned.Request.ReferenceContext != historical || strings.Contains(planned.Request.WorkflowContext, filepath.Join(project, ".agents", "skills", "helper")) {
+		t.Fatalf("planning did not restore the recorded source: %v", err)
+	}
+	var receipts []event.Event
+	planned.EmitLoads(event.NewBus(func(e event.Event) { receipts = append(receipts, e) }), "planner")
+	if len(receipts) != 1 || receipts[0].SkillSource != source.Source || receipts[0].TaskID != "planner" {
+		t.Fatalf("reload receipt lost source identity: %+v", receipts)
+	}
+	fresh, _, err := agent.PrepareSkillRequest(current, skills.Request{Instructions: "Use /helper"})
+	if err != nil || !strings.Contains(fresh.ReferenceContext, "Replacement must not be loaded.") {
+		t.Fatalf("a fresh explicit request lost normal precedence: %v", err)
+	}
+	original.Instructions = "Use /helper"
+	combined, err := agent.PlanSkillRequest(current, original)
+	if err != nil || !strings.Contains(combined.Request.ReferenceContext, "Replacement must not be loaded.") || !strings.Contains(combined.Request.ReferenceContext, "Original personal helper.") {
+		t.Fatalf("new explicit read lost either current or retained reference: %v", err)
+	}
+	if strings.Count(combined.Request.WorkflowContext, `"name":"helper"`) != 2 {
+		t.Fatal("new explicit read collapsed distinct recorded source identities")
+	}
 }
 
-func TestCompleteHistoricalReplacementDoesNotResolveOrGrantNewEligibility(t *testing.T) {
+func TestCompactedSkillUnavailableSourceDoesNotUseReplacement(t *testing.T) {
+	for _, change := range []string{"removed", "invalid", "redirected"} {
+		t.Run(change, func(t *testing.T) {
+			f := newSkillMountFixture(t)
+			personal := f
+			personal.root = f.home
+			personal.add(t, "shared", "shared")
+			catalog := skills.Discover(f.root, f.home)
+			original, err := catalog.Resolve("shared")
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, _, err := agent.PrepareSkillRequest(catalog, skills.Request{Instructions: "Use /shared"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Instructions, request.ReferenceContext = "Continue", ""
+			f.add(t, "replacement", "shared")
+			switch change {
+			case "removed", "redirected":
+				if err := os.RemoveAll(original.BaseDir); err != nil {
+					t.Fatal(err)
+				}
+				if change == "redirected" {
+					if err := os.Symlink(filepath.Join(f.root, ".agents", "skills", "replacement"), original.BaseDir); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "invalid":
+				if err := os.WriteFile(original.Source, []byte("---\nname: shared\n---\nMissing description."), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			current := skills.Discover(f.root, f.home)
+			for _, prepare := range []func(*skills.Catalog, skills.Request) (agent.PreparedSkillRequest, error){agent.PlanSkillRequest, agent.PrepareSkillContinuation} {
+				_, err := prepare(current, request)
+				if err == nil || !strings.Contains(err.Error(), original.Source) {
+					t.Errorf("missing recorded source did not fail explicitly: %v", err)
+				}
+			}
+			if f.overlays(t)["/work/.agents/skills/replacement"] {
+				t.Error("unavailable original registered the replacement mount")
+			}
+		})
+	}
+}
+
+func TestCompletedSourceDoesNotResolveOrGrantNewEligibility(t *testing.T) {
 	project, home := t.TempDir(), t.TempDir()
 	write := func(root, metadata, body string) string {
 		t.Helper()
@@ -60,7 +139,7 @@ func TestCompleteHistoricalReplacementDoesNotResolveOrGrantNewEligibility(t *tes
 		}
 		return path
 	}
-	write(home, "", "Personal reference.")
+	path := write(home, "", "Personal reference.")
 	worker := &agent.Agent{Registry: agent.NewRegistry()}
 	worker.ConfigureSkills(skills.Discover(project, home), nil, false)
 	if _, err := worker.PrepareInput("Investigate evidence"); err != nil {
@@ -74,7 +153,7 @@ func TestCompleteHistoricalReplacementDoesNotResolveOrGrantNewEligibility(t *tes
 		t.Fatal(err)
 	}
 	original := skills.Request{Instructions: "Continue", WorkflowContext: agent.WorkflowContext(worker.SkillHistory())}
-	path := write(project, "", "Replacement historical bytes.")
+	write(project, "", "Replacement must not be loaded.")
 	loaded, _, err := agent.CompleteSkillRequest(skills.Discover(project, home), original)
 	if err != nil {
 		t.Fatal(err)
@@ -82,14 +161,13 @@ func TestCompleteHistoricalReplacementDoesNotResolveOrGrantNewEligibility(t *tes
 	if !strings.Contains(loaded.WorkflowContext, path) {
 		t.Fatal("actual loaded source not recorded")
 	}
-	// Merge both old and current reminders, as owned worker reads do. The old
-	// body is missing; the replacement body is complete historical context.
+	// Merging reminders from owned workers must retain the same source.
 	loaded.WorkflowContext = agent.MergeSkillSources(original.WorkflowContext, loaded.WorkflowContext)
-	write(project, "disable-model-invocation: true\n", "Changed bytes must not refresh history.")
+	write(home, "disable-model-invocation: true\n", "Changed bytes must not refresh history.")
 	current := skills.Discover(project, home)
 	retained, _, err := agent.CompleteSkillRequest(current, loaded)
 	if err != nil || retained.ReferenceContext != loaded.ReferenceContext {
-		t.Fatalf("complete replacement history changed: %v", err)
+		t.Fatalf("complete source history changed: %v", err)
 	}
 	if strings.Count(retained.WorkflowContext, `"name":"helper"`) != 1 {
 		t.Fatal("reconciled sources not deduplicated")
@@ -100,7 +178,7 @@ func TestCompleteHistoricalReplacementDoesNotResolveOrGrantNewEligibility(t *tes
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(home, ".agents", "skills", "helper", "SKILL.md")); err != nil {
+	if err := os.Remove(filepath.Join(project, ".agents", "skills", "helper", "SKILL.md")); err != nil {
 		t.Fatal(err)
 	}
 	retained, _, err = agent.CompleteSkillRequest(skills.Discover(project, home), retained)
