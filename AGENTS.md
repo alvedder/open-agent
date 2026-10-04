@@ -263,3 +263,20 @@ Arbiter protocol that works (from the experiments):
    curl/HTTP checks miss), and grep for external URLs.
 6. Track per-subtask attempts; after ~4 failed attempts, split the task or move it up
    a tier — don't keep re-rolling the same prompt.
+
+## Agent skills
+
+### Issue tracker
+
+Track issues and specs in `alvedder/open-agent` on GitHub. Read
+`docs/agents/issue-tracker.md` before creating, migrating or updating tickets.
+
+### Triage labels
+
+Use the five canonical triage labels. Read `docs/agents/triage-labels.md` before
+triaging or changing readiness labels.
+
+### Domain docs
+
+Use the single-context layout. Read `docs/agents/domain.md` when exploring domain
+terms or architecture decisions.
